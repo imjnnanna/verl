@@ -254,6 +254,7 @@ class RayPPOTrainer:
         collate_fn=None,
         train_sampler: Optional[Sampler] = None,
         device_name=None,
+        parallelism_overrides: Optional[dict] = None,
     ):
         """
         Initialize distributed PPO trainer with Ray backend.
@@ -288,6 +289,7 @@ class RayPPOTrainer:
 
         self.role_worker_mapping = role_worker_mapping
         self.resource_pool_manager = resource_pool_manager
+        self.parallelism_overrides = parallelism_overrides or {}
         self.use_reference_policy = need_reference_policy(self.config)
         self.use_teacher_policy = need_teacher_policy(self.config)
 
@@ -703,6 +705,11 @@ class RayPPOTrainer:
         1. Ray resource pools from configuration
         2. Worker groups for each role (actor, critic, etc.)
         """
+
+        if self.parallelism_overrides:
+            from verl.trainer.ppo.auto_mapping.ray_config import apply_parallelism_overrides
+            apply_parallelism_overrides(self.config, self.parallelism_overrides)
+
         self.resource_pool_manager.create_resource_pool()
 
         self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}

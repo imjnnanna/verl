@@ -90,7 +90,7 @@ def valid_submeshes(n: int, m: int, min_area: int) -> List[Tuple[int, int]]:
 
     return submeshes
     
-def enum_submesh_shapes(
+def enum_submesh(
     n: int,
     m: int,
     a_min: List[int],
