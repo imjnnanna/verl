@@ -5,11 +5,10 @@
 # parallelism_overrides: dict[Role, dict]
 
 from dataclasses import dataclass
-from enumerators import enum_placement_groups
+from enumerators import enum_placement_groups, enum_submesh
 from auto_parallel import auto_parallel
 from mem_model import get_min_alloc
 from simulators import simulate
-from submesh import SubmeshSolver
 import numpy as np
 
 @dataclass
@@ -42,6 +41,18 @@ class Solver:
 		self.N = N # int - number of servers
 		self.M = M # int - number of devices per server
 		self.Q = Q # int - memory capacity per GPU
+	
+	def compute_cost(self, g, l_parallel):
+		s = 3 # number of stages in D
+		c = [0] * s # computation cost per stage
+
+		for group in g:
+			c_g = [0] * s
+			for i in range(s):
+				for l in group:
+					c_g[i] += simulate(l_parallel[l], self.W[l])
+			c[i] = max(c[i], c_g[i])
+		return sum(c)
 
 	def solve(self) -> tuple[dict, dict, dict]:
 		# return resource_pool_spec, mapping, parallelism_overrides
@@ -50,14 +61,17 @@ class Solver:
 		best_mapping = None
 
 		# calculate cost for each placement group and submesh shape, and find the best one
-		submesh_solver = SubmeshSolver(self.N, self.M)
 		for g in G:
-			for placement_group in g:
-				A_min = get_min_alloc(placement_group, self.Q, self.N * self.M)
-				submesh_solver.intra_op(placement_group, A_min, self.W)
-		
-		submesh_solver.inter_op_dp()
-
-		device_mapping = assign_mapping_from_submesh()
-
-		return self.auto_device_mapping()
+			A_min = get_min_alloc(g, self.Q, self.N * self.M)
+			for submeshes in enum_submesh(self.N, self.M, A_min):
+				l_parallel = {}
+				for i, group in enumerate(g):
+					device_mesh = LogicalDeviceMesh(submeshes[i]) # TODO: fix this part
+					for l in group:
+						l_parallel[l] = auto_parallel(l, A_min, self.W[l], device_mesh)
+				cost = self.compute_cost(g, l_parallel)
+				if cost < best_cost:
+					best_cost = cost
+					best_mapping = (g, submeshes, l_parallel)
+     
+		return best_mapping
