@@ -60,6 +60,9 @@ def apply_parallelism_overrides(config, overrides: dict[Any, dict[str, int]]) ->
     for _role, kvs in overrides.items():
         for path, value in kvs.items():
             if is_omega:
+                parent = path.rsplit(".", 1)[0]
+                if OmegaConf.select(config, parent, default=None) is None:
+                    continue
                 OmegaConf.update(config, path, value, merge=True)
             else:
                 _setattr_path(config, path, value)

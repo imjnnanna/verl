@@ -152,6 +152,12 @@ def enum_submesh_shapes(N: int, M: int, A_min: List[int]) -> List[List[Tuple[int
 
     return [list(t) for t in tilings]
 
+def enum_submesh(n, m, a_min):
+    result = enum_submesh_shapes(n, m, a_min)
+    if result is None:
+        return
+    yield list(result)
+
 # if __name__ == "__main__":
 #     N = 3
 #     M = 16
