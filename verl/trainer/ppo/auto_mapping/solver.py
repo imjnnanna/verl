@@ -5,8 +5,11 @@
 # parallelism_overrides: dict[Role, dict]
 
 from dataclasses import dataclass
-from enumerators import enum_placement_groups, enum_submesh, get_min_alloc
-from simulators import simulate, get_cost
+from enumerators import enum_placement_groups
+from auto_parallel import auto_parallel
+from mem_model import get_min_alloc
+from simulators import simulate
+from submesh import SubmeshSolver
 import numpy as np
 
 @dataclass
@@ -24,7 +27,7 @@ class PhysicalDeviceMesh:
 		self.num_devices = num_hosts * num_devices_per_host # int
 
 class LogicalDeviceMesh:
-	def __init__(self, physical_mesh, id_mesh, mesh_alpha, mesh_beta):
+	def __init__(self, physical_mesh, id_mesh, mesh_alpha=None, mesh_beta=None):
 		self.physical_mesh = physical_mesh # PhysicalDeviceMesh
 		self.id_mesh = np.array(id_mesh) # np.array - logical grid of device IDs
 		self.flattened_id_mesh = tuple(int(x) for x in id_mesh.flatten()) # tuple[int] - flattened logical grid of device IDs
@@ -39,11 +42,22 @@ class Solver:
 		self.N = N # int - number of servers
 		self.M = M # int - number of devices per server
 		self.Q = Q # int - memory capacity per GPU
-		self.para_cost_cache = {} # dict[tuple[list, tuple[int, int]], float] - cache for parallelism cost simulations per placement group and physical mesh shape
 
 	def solve(self) -> tuple[dict, dict, dict]:
 		# return resource_pool_spec, mapping, parallelism_overrides
+		G = enum_placement_groups(self.D, self.L, self.N * self.M)
+		best_cost = float('inf')
+		best_mapping = None
 
+		# calculate cost for each placement group and submesh shape, and find the best one
+		submesh_solver = SubmeshSolver(self.N, self.M)
+		for g in G:
+			for placement_group in g:
+				A_min = get_min_alloc(placement_group, self.Q, self.N * self.M)
+				submesh_solver.intra_op(placement_group, A_min, self.W)
 		
+		submesh_solver.inter_op_dp()
+
+		device_mapping = assign_mapping_from_submesh()
 
 		return self.auto_device_mapping()
