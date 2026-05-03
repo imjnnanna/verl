@@ -1,5 +1,6 @@
-from solver import LogicalDeviceMesh, Workload
-from simulators import simulate
+# from solver import LogicalDeviceMesh, Workload
+from __future__ import annotations
+from .simulators import simulate
 
 def auto_parallel(l: int, A_min: list[tuple[int, int]], W: Workload, device_mesh: LogicalDeviceMesh) -> tuple[int, tuple[int, int, int]]:
 	# return cost and (PP, DP, TP) for model l

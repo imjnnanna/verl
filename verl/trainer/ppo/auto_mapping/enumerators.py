@@ -52,7 +52,7 @@ from functools import lru_cache
 
 
 
-def enum_placement_groups(L: List[Role], N_gpus: int) -> List[Tuple[Tuple[int, ...], ...]]:
+def enum_placement_groups(L: List[int], N_gpus: int) -> List[Tuple[Tuple[int, ...], ...]]:
     # enumerate all Bell partitions of models into colocated placement groups
     placements = []
     
@@ -90,7 +90,7 @@ def valid_submeshes(n: int, m: int, min_area: int) -> List[Tuple[int, int]]:
 
     return submeshes
     
-def enum_submesh(
+def enum_submesh_shapes(
     n: int,
     m: int,
     a_min: List[int],
@@ -160,6 +160,12 @@ def enum_submesh(
         return None
 
     return list(result)
+
+def enum_submesh(n, m, a_min):
+    result = enum_submesh_shapes(n, m, a_min)
+    if result is None:
+        return
+    yield list(result)
 
 # if __name__ == "__main__":
 #     L = [Role.Actor, Role.Critic, Role.RefPolicy]
