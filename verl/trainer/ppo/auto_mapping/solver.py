@@ -30,6 +30,10 @@ class LogicalDeviceMesh:
 		self.physical_mesh = physical_mesh # PhysicalDeviceMesh
 		self.id_mesh = np.array(id_mesh) # np.array - logical grid of device IDs
 		self.flattened_id_mesh = tuple(int(x) for x in id_mesh.flatten()) # tuple[int] - flattened logical grid of device IDs
+		if mesh_alpha is None:
+			mesh_alpha = [1.0] * len(id_mesh.shape)
+		if mesh_beta is None:
+			mesh_beta = [1.0] * len(id_mesh.shape)
 		self.mesh_alpha = mesh_alpha # list[float] - per-mesh-dimension latency coefficients
 		self.mesh_beta = mesh_beta # list[float] - per-mesh-dimension bandwidth coefficients
     
@@ -75,3 +79,15 @@ class Solver:
 					best_mapping = (g, submeshes, l_parallel)
      
 		return best_mapping
+
+if __name__ == "__main__":
+    # Example usage
+	D = [(0, 1), (1, 2)] # example dataflow graph edges
+	L = [0, 1, 2] # example LLMs
+	W = {0: Workload(128, 128, "training"), 1: Workload(256, 256, "inference"), 2: Workload(512, 512, "generation")} # example workloads
+	N = 4 # number of servers
+	M = 8 # number of devices per server
+	Q = 40 # memory capacity per GPU in GB
+
+	solver = Solver(D, L, W, N, M, Q)
+	resource_pool_spec, mapping, parallelism_overrides = solver.solve()

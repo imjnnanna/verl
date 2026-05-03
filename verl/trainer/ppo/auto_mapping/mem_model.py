@@ -1,7 +1,7 @@
-# get_min_alloc
-# use libraries like llm-analysis?
+from typing import List, Tuple
 
-def get_min_alloc(placement_group, Q: int, N_gpus: int) -> tuple[int, int]:
-    # return A_min for a given placement group, memory capacity Q, and total number of GPUs N_gpus
-	# A_min is the minimum submesh shape (t, p) that can fit the placement group within memory constraints
+def get_min_alloc(g, Q: int, N_gpus: int) -> List[Tuple[Tuple[int, int, int],...]]:
+    # return A_min for each model based on memory capacity Q and total number of GPUs N_gpus
+	# A_min[l] is the minimum submesh shape (t, p) that can fit the placement group within memory constraints and the num_devices needed
+	# order should follow the order of g
 	raise NotImplementedError()
