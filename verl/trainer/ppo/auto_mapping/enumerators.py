@@ -79,7 +79,7 @@ def valid_submeshes(n: int, m: int, min_area: int) -> List[Tuple[int, int]]:
     submeshes = []
 
     # 1-row submeshes: (1, 1), ..., (1, m)
-    for w in range(0, math.log2(m) + 1):
+    for w in range(0, int(math.log2(m)) + 1):
         if 2**w >= min_area:
             submeshes.append((1, 2**w))
 

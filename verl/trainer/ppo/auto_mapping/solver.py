@@ -81,7 +81,9 @@ class Solver:
 						continue
 				l_parallel = {}
 				for i, group in enumerate(g):
-					device_mesh = LogicalDeviceMesh(submeshes[i]) # TODO: fix this part
+					h, w = submeshes[i]
+					id_mesh = np.arange(h * w).reshape((h, w))
+					device_mesh = LogicalDeviceMesh(physical_mesh=None, id_mesh=id_mesh)
 					for l in group:
 						l_parallel[l] = auto_parallel(l, A_min, self.W[l], device_mesh)
 				cost = self.compute_cost(g, l_parallel)
