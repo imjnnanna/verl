@@ -31,6 +31,9 @@ from verl.trainer.ppo.utils import need_critic, need_reference_policy
 from verl.utils.config import validate_config
 from verl.utils.device import auto_set_device, is_cuda_available
 from verl.utils.import_utils import load_extern_object
+from verl.trainer.ppo.auto_mapping.ray_config import get_topology
+from verl.trainer.ppo.auto_mapping.solver import Solver, Workload
+from verl.trainer.ppo.ray_trainer import ResourcePoolManager
 
 
 @hydra.main(config_path="config", config_name="ppo_trainer", version_base=None)
@@ -120,6 +123,7 @@ class TaskRunner:
     def __init__(self):
         self.role_worker_mapping = {}
         self.mapping = {}
+        self.parallelism_overrides: dict = {}
 
     def add_actor_rollout_worker(self, config):
         """Add actor rollout worker based on the actor strategy."""
@@ -221,6 +225,10 @@ class TaskRunner:
     def init_resource_pool_mgr(self, config):
         """Initialize resource pool manager."""
 
+        # Auto-mapping path
+        if config.trainer.get("auto_mapping", {}).get("enable", False):
+            return self._init_resource_pool_mgr_auto(config)
+
         global_pool_id = "global_pool"
         resource_pool_spec = {
             global_pool_id: [config.trainer.n_gpus_per_node] * config.trainer.nnodes,
@@ -258,6 +266,56 @@ class TaskRunner:
 
         resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=self.mapping)
         return resource_pool_manager
+
+    def _init_resource_pool_mgr_auto(self, config):
+        """Auto-mapping ResourcePoolManager construction."""
+
+        topology = get_topology(config)
+        roles = list(self.role_worker_mapping.keys())
+        L = list(range(len(roles)))
+        prompt_len = int(config.data.get("max_prompt_length", 1024))
+        response_len = int(config.data.get("max_response_length", 1024))
+        # TODO: differentiate compute_type per role (after simulators support per-role compute_type)
+        W = {i: Workload(prompt_len, response_len, "training") for i in L}
+        D = [(i, i + 1) for i in range(len(roles) - 1)]
+        Q = int(config.trainer.get("auto_mapping", {}).get("per_gpu_budget_gb", 80)) * 1024 ** 3
+
+        solver = Solver(
+            D=D, L=L, W=W,
+            N=topology.num_hosts(), M=topology.gpus_per_host(), Q=Q,
+            topology=topology,
+            role_worker_mapping=self.role_worker_mapping,
+        )
+        resource_pool_spec, mapping, overrides = solver.solve()
+
+        # Honor pre-set entries if unclaimed by solver
+        for role, pool in self.mapping.items():
+            mapping.setdefault(role, pool)
+
+        # Manually-allocated) pools - TODO subtract these from topology before solver
+        if config.reward.reward_model.enable_resource_pool:
+            if config.reward.reward_model.n_gpus_per_node <= 0:
+                raise ValueError("config.reward.reward_model.n_gpus_per_node must be greater than 0")
+            if config.reward.reward_model.nnodes <= 0:
+                raise ValueError("config.reward.reward_model.nnodes must be greater than 0")
+            resource_pool_spec["reward_pool"] = (
+                [config.reward.reward_model.n_gpus_per_node] * config.reward.reward_model.nnodes
+            )
+
+        distillation_config = config.get("distillation")
+        if is_distillation_enabled(distillation_config) and distillation_config.teacher_model.enable_resource_pool:
+            if distillation_config.teacher_model.n_gpus_per_node <= 0:
+                raise ValueError("config.distillation.teacher_model.n_gpus_per_node must be greater than 0")
+            if distillation_config.teacher_model.nnodes <= 0:
+                raise ValueError("config.distillation.teacher_model.nnodes must be greater than 0")
+            resource_pool_spec["teacher_pool"] = (
+                [distillation_config.teacher_model.n_gpus_per_node] * distillation_config.teacher_model.nnodes
+            )
+
+        self.mapping = mapping
+        self.parallelism_overrides = overrides
+
+        return ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=self.mapping)
 
     def add_reward_model_resource_pool(self, config):
         """Add reward model worker if enabled."""
@@ -384,6 +442,7 @@ class TaskRunner:
             val_dataset=val_dataset,
             collate_fn=collate_fn,
             train_sampler=train_sampler,
+            parallelism_overrides=self.parallelism_overrides,
         )
         # Initialize the workers of the trainer.
         trainer.init_workers()

@@ -5,10 +5,12 @@
 # parallelism_overrides: dict[Role, dict]
 
 from dataclasses import dataclass
-from enumerators import enum_placement_groups, enum_submesh_shapes
-from auto_parallel import auto_parallel
-from mem_model import get_min_alloc
-from simulators import simulate
+from .enumerators import enum_placement_groups, enum_submesh
+from .auto_parallel import auto_parallel
+from .mem_model import get_min_alloc
+from .simulators import simulate
+from .assignment import assign_machines_greedy
+from .ray_config import export_solver_result
 import numpy as np
 
 @dataclass
@@ -38,13 +40,15 @@ class LogicalDeviceMesh:
 		self.mesh_beta = mesh_beta # list[float] - per-mesh-dimension bandwidth coefficients
     
 class Solver:
-	def __init__(self, D, L, W, N, M, Q):
-		self.D = D # list[tuple[int, int, int]] - RLHF dataflow graph DAG edges and stage number (src, dst, stage)
+	def __init__(self, D, L, W, N, M, Q, topology=None, role_worker_mapping=None):
+		self.D = D # list[tuple[int, int]] - RLHF dataflow graph DAG edges
 		self.L = L # list[Role] - LLMs in RLHF dataflow
 		self.W = W # dict[int, Workload] - workload of LLMs in RLHF dataflow
 		self.N = N # int - number of servers
 		self.M = M # int - number of devices per server
 		self.Q = Q # int - memory capacity per GPU
+		self.topology = topology # topology - physical bandwidth tiers; for ray_config export
+		self.role_worker_mapping = role_worker_mapping # dict[Role, WorkerType] - solver-id i in list(role_worker_mapping)[i]
 	
 	def compute_cost(self, g, l_parallel):
 		s = 3 # number of stages in D
@@ -60,9 +64,10 @@ class Solver:
 
 	def solve(self) -> tuple[dict, dict, dict]:
 		# return resource_pool_spec, mapping, parallelism_overrides
-		G = enum_placement_groups(self.D, self.L, self.N * self.M)
+		G = enum_placement_groups(self.L, self.N * self.M)
 		best_cost = float('inf')
 		best_mapping = None
+		best_assignments = None
 
 		# calculate cost for each placement group and submesh shape, and find the best one
 		# TODO: optimize by getting rid of redundant calculations
@@ -71,6 +76,12 @@ class Solver:
 			A_min = get_min_alloc(g, self.Q, self.N * self.M)
 			min_area = [model[2] for group in A_min for model in group]
 			for submeshes in enum_submesh_shapes(self.N, self.M, A_min):
+				assignments = None
+				if self.topology is not None:
+					# skip non-packing submeshes
+					assignments = assign_machines_greedy(list(submeshes), self.topology)
+					if assignments is None:
+						continue
 				l_parallel = {}
 				l_cost = {}
 				for i, group in enumerate(g):
@@ -81,8 +92,12 @@ class Solver:
 				if cost < best_cost:
 					best_cost = cost
 					best_mapping = (g, submeshes, l_parallel)
-     
-		return best_mapping
+					best_assignments = assignments
+
+		if self.topology is None or self.role_worker_mapping is None:
+			return best_mapping
+		g, submeshes, l_parallel = best_mapping
+		return export_solver_result(g, submeshes, l_parallel, best_assignments, self.role_worker_mapping)
 
 # if __name__ == "__main__":
 #     # Example usage
