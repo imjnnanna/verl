@@ -55,6 +55,12 @@ class Role(Enum):
         }
         return role_mapping.get(self, self.name.lower())
 
+    def is_actor(self):
+        return self in {Role.Actor, Role.ActorRollout, Role.ActorRolloutRef, Role.Rollout}
+    
+    def is_ref(self):
+        return self in {Role.RefPolicy, Role.ActorRolloutRef}
+    
     @classmethod
     def from_string(cls, name: str):
         string_mapping = {

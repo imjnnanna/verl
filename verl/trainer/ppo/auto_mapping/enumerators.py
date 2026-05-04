@@ -3,32 +3,70 @@ from verl.trainer.ppo.utils import Role
 import math
 from functools import lru_cache
 
-# TODO: add colocation constraints to enum_placement_groups, e.g. "model 0 and model 2 must be colocated"
 def enum_placement_groups(L: List[Role], N_gpus: int, colocate_same_models=True) -> List[Tuple[Tuple[int, ...], ...]]:
     '''
     Enumerate all Bell partitions of models into colocated placement groups.
-    
+
+    When colocate_same_models=True, any two roles that are both actors (is_actor())
+    or both refs (is_ref()) are forced into the same placement group.
+
     Returns:
         List of groups:
             ((model_id, ...), ...) - each inner tuple is a colocated group of models
     '''
+    n = len(L)
+
+    # Build must-colocate adjacency: pairs that must share a group.
+    must_colocate: List[set] = [set() for _ in range(n)]
+    if colocate_same_models:
+        for i in range(n):
+            for j in range(i + 1, n):
+                if (L[i].is_actor() and L[j].is_actor()) or (L[i].is_ref() and L[j].is_ref()):
+                    must_colocate[i].add(j)
+                    must_colocate[j].add(i)
+
     placements = []
-    
+    model_to_group: List[int] = [-1] * n
+
     def backtrack(i: int, groups: List[List[int]]) -> None:
-        if i == len(L):
+        if i == n:
             placements.append(tuple(tuple(group) for group in groups))
             return
-        
-        for group in groups:
-            group.append(i)
+
+        # Determine if any already-placed partner constrains which group i must join.
+        required_group = None
+        for j in must_colocate[i]:
+            if model_to_group[j] == -1:
+                continue
+            if required_group is None:
+                required_group = model_to_group[j]
+            elif required_group != model_to_group[j]:
+                # Partners already split across groups — infeasible branch.
+                return
+
+        if required_group is not None:
+            # i must join the group that contains its already-placed partners.
+            groups[required_group].append(i)
+            model_to_group[i] = required_group
             backtrack(i + 1, groups)
-            group.pop()
-        
-        if len(groups) < N_gpus:
-            groups.append([i])
-            backtrack(i + 1, groups)
-            groups.pop()
-            
+            groups[required_group].pop()
+            model_to_group[i] = -1
+        else:
+            # No placed partners yet: i can join any existing group or start a new one.
+            for g_idx, group in enumerate(groups):
+                group.append(i)
+                model_to_group[i] = g_idx
+                backtrack(i + 1, groups)
+                group.pop()
+                model_to_group[i] = -1
+
+            if len(groups) < N_gpus:
+                groups.append([i])
+                model_to_group[i] = len(groups) - 1
+                backtrack(i + 1, groups)
+                groups.pop()
+                model_to_group[i] = -1
+
     backtrack(0, [])
     return placements
 
@@ -160,7 +198,7 @@ def enum_submesh(n, m, a_min):
     yield list(result)
 
 # if __name__ == "__main__":
+#     L = [Role.Actor, Role.Rollout, Role.Critic, Role.RefPolicy]
 #     N = 3
-#     M = 16
-#     A_min = [1, 2, 1, 1, 1]
-#     print(enum_submesh_shapes(N, M, A_min))
+    
+#     print(enum_placement_groups(L, N, colocate_same_models=True))
