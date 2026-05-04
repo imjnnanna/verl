@@ -3,7 +3,8 @@ from verl.trainer.ppo.utils import Role
 import math
 from functools import lru_cache
 
-def enum_placement_groups(L: List[Role], N_gpus: int) -> List[Tuple[Tuple[int, ...], ...]]:
+# TODO: add colocation constraints to enum_placement_groups, e.g. "model 0 and model 2 must be colocated"
+def enum_placement_groups(L: List[Role], N_gpus: int, colocate_same_models=True) -> List[Tuple[Tuple[int, ...], ...]]:
     '''
     Enumerate all Bell partitions of models into colocated placement groups.
     

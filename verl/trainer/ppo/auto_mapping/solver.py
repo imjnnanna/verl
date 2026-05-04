@@ -4,7 +4,7 @@
 # mapping: dict[Role, str]
 # parallelism_overrides: dict[Role, dict]
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from .enumerators import enum_placement_groups, enum_submesh
 from .auto_parallel import auto_parallel
 from .mem_model import get_min_alloc
@@ -28,27 +28,48 @@ class DeviceMesh:
 			mesh_beta = [1.0] * len(id_mesh.shape)
 		self.mesh_alpha = mesh_alpha # list[float] - per-mesh-dimension latency coefficients
 		self.mesh_beta = mesh_beta # list[float] - per-mesh-dimension bandwidth coefficients
+
+@dataclass
+class DataflowGraph:
+    edges: list[tuple[int, int]]
+    stages: list[list[int]] # list of stages, each stage is a list of LLM indices
+    role_to_stage: dict[int, int] = field(init=False) 
+    
+    def __post_init__(self):
+        self.role_to_stage = {
+			role: i
+			for i, stage in enumerate(self.stages) 
+			for role in stage
+		}
+    
+    @property
+    def num_stages(self) -> int:
+        return len(self.stages)
+    
+    def roles_in_stage(self, stage_idx: int) -> list[int]:
+        return self.stages[stage_idx]
     
 class Solver:
 	def __init__(self, D, L, W, N, M, Q, topology=None, role_worker_mapping=None):
-		self.D = D # list[tuple[int, int]] - RLHF dataflow graph DAG edges
-		self.L = L # list[Role] - LLMs in RLHF dataflow
-		self.W = W # dict[int, Workload] - workload of LLMs in RLHF dataflow
+		self.D = D # DataflowGraph - dataflow graph of the RLHF pipeline
+		self.L = L # list[Role] - Roles in RLHF dataflow
+		self.W = W # dict[int, Workload] - workload of roles in RLHF dataflow
 		self.N = N # int - number of servers
 		self.M = M # int - number of devices per server
 		self.Q = Q # int - memory capacity per GPU
 		self.topology = topology # topology - physical bandwidth tiers; for ray_config export
 		self.role_worker_mapping = role_worker_mapping # dict[Role, WorkerType] - solver-id i in list(role_worker_mapping)[i]
 	
-	def compute_cost(self, g, l_parallel):
-		s = 3 # number of stages in D
+	def compute_cost(self, g, l_cost):
+		s = self.D.num_stages 
 		c = [0] * s # computation cost per stage
 
 		for group in g:
 			c_g = [0] * s
 			for i in range(s):
 				for l in group:
-					c_g[i] += simulate(l_parallel[l], self.W[l])
+					if l in self.D.roles_in_stage(i):
+						c_g[i] += l_cost[l]
 			c[i] = max(c[i], c_g[i])
 		return sum(c)
 
@@ -61,7 +82,6 @@ class Solver:
 
 		# calculate cost for each placement group and submesh shape, and find the best one
 		# TODO: optimize by getting rid of redundant calculations
-		# TODO: auto_parallel different workloads
 		for g in G:
 			A_min = get_min_alloc(g, self.Q, self.N * self.M)
 			min_area = [model[2] for group in A_min for model in group]
