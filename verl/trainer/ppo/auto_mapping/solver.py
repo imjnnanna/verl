@@ -5,10 +5,9 @@
 # parallelism_overrides: dict[Role, dict]
 
 from dataclasses import dataclass, field
-from .enumerators import enum_placement_groups, enum_submesh
+from .enumerators import enum_placement_groups, enum_submesh_shapes
 from .auto_parallel import auto_parallel
 from .mem_model import get_min_alloc
-from .simulators import simulate
 from .assignment import assign_machines_greedy
 from .ray_config import export_solver_result
 import numpy as np
@@ -80,12 +79,17 @@ class Solver:
 		best_mapping = None
 		best_assignments = None
 
-		# calculate cost for each placement group and submesh shape, and find the best one
-		# TODO: optimize by getting rid of redundant calculations
+		submesh_cache = {}   # min_area -> list of submesh configs from enum_submesh_shapes
+		ap_cache = {}        # (l, min_area, h, w) -> (cost, parallel) from auto_parallel
+
 		for g in G:
 			A_min = get_min_alloc(g, self.Q, self.N * self.M)
-			min_area = [model[2] for group in A_min for model in group]
-			for submeshes in enum_submesh(self.N, self.M, A_min):
+			min_area = tuple(model[2] for group in A_min for model in group)
+
+			if min_area not in submesh_cache:
+				submesh_cache[min_area] = enum_submesh_shapes(self.N, self.M, list(min_area))
+
+			for submeshes in submesh_cache[min_area]:
 				assignments = None
 				if self.topology is not None:
 					# skip non-packing submeshes
@@ -99,7 +103,10 @@ class Solver:
 					id_mesh = np.arange(h * w).reshape((h, w))
 					device_mesh = DeviceMesh(id_mesh=id_mesh)
 					for l in group:
-						l_cost[l], l_parallel[l] = auto_parallel(l, A_min, self.W[l], device_mesh)
+						key = (l, min_area, h, w)
+						if key not in ap_cache:
+							ap_cache[key] = auto_parallel(l, A_min, self.W[l], device_mesh)
+						l_cost[l], l_parallel[l] = ap_cache[key]
 				cost = self.compute_cost(g, l_cost)
 				if cost < best_cost:
 					best_cost = cost
