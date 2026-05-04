@@ -13,7 +13,7 @@ def enum_placement_groups(L: List[Role], N_gpus: int) -> List[Tuple[Tuple[int, .
     '''
     placements = []
     
-    def backtrack(i: int, groups: List[List]) -> None:
+    def backtrack(i: int, groups: List[List[int]]) -> None:
         if i == len(L):
             placements.append(tuple(tuple(group) for group in groups))
             return

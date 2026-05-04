@@ -20,18 +20,8 @@ class Workload:
     compute_type: str # "training", "inference", or "generation"
     
 class DeviceMesh:
-	def __init__(self, host_ids, host_info, num_hosts, num_devices_per_host):
-		self.host_ids = host_ids # list[int]
-		self.host_info = host_info # dict[int, dict] - mapping from host_id to host specifications (e.g., CPU, memory, GPU type)
-		self.num_hosts = num_hosts # int
-		self.num_devices_per_host = num_devices_per_host # int
-		self.num_devices = num_hosts * num_devices_per_host # int
-
-class LogicalDeviceMesh:
-	def __init__(self, physical_mesh, id_mesh, mesh_alpha=None, mesh_beta=None):
-		self.physical_mesh = physical_mesh # PhysicalDeviceMesh
+	def __init__(self, id_mesh, mesh_alpha=None, mesh_beta=None):
 		self.id_mesh = np.array(id_mesh) # np.array - logical grid of device IDs
-		self.flattened_id_mesh = tuple(int(x) for x in id_mesh.flatten()) # tuple[int] - flattened logical grid of device IDs
 		if mesh_alpha is None:
 			mesh_alpha = [1.0] * len(id_mesh.shape)
 		if mesh_beta is None:
@@ -75,7 +65,7 @@ class Solver:
 		for g in G:
 			A_min = get_min_alloc(g, self.Q, self.N * self.M)
 			min_area = [model[2] for group in A_min for model in group]
-			for submeshes in enum_submesh_shapes(self.N, self.M, A_min):
+			for submeshes in enum_submesh(self.N, self.M, A_min):
 				assignments = None
 				if self.topology is not None:
 					# skip non-packing submeshes
@@ -87,7 +77,7 @@ class Solver:
 				for i, group in enumerate(g):
 					h, w = submeshes[i]
 					id_mesh = np.arange(h * w).reshape((h, w))
-					device_mesh = LogicalDeviceMesh(physical_mesh=None, id_mesh=id_mesh)
+					device_mesh = DeviceMesh(id_mesh=id_mesh)
 					for l in group:
 						l_cost[l], l_parallel[l] = auto_parallel(l, A_min, self.W[l], device_mesh)
 				cost = self.compute_cost(g, l_cost)
