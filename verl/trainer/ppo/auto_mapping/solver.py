@@ -5,7 +5,7 @@
 # parallelism_overrides: dict[Role, dict]
 
 from dataclasses import dataclass
-from enumerators import enum_placement_groups, enum_submesh
+from enumerators import enum_placement_groups, enum_submesh_shapes
 from auto_parallel import auto_parallel
 from mem_model import get_min_alloc
 from simulators import simulate
@@ -17,7 +17,7 @@ class Workload:
     d_out: int # output sequence length
     compute_type: str # "training", "inference", or "generation"
     
-class PhysicalDeviceMesh:
+class DeviceMesh:
 	def __init__(self, host_ids, host_info, num_hosts, num_devices_per_host):
 		self.host_ids = host_ids # list[int]
 		self.host_info = host_info # dict[int, dict] - mapping from host_id to host specifications (e.g., CPU, memory, GPU type)
@@ -39,7 +39,7 @@ class LogicalDeviceMesh:
     
 class Solver:
 	def __init__(self, D, L, W, N, M, Q):
-		self.D = D # list[tuple[int, int]] - RLHF dataflow graph DAG edges
+		self.D = D # list[tuple[int, int, int]] - RLHF dataflow graph DAG edges and stage number (src, dst, stage)
 		self.L = L # list[Role] - LLMs in RLHF dataflow
 		self.W = W # dict[int, Workload] - workload of LLMs in RLHF dataflow
 		self.N = N # int - number of servers
@@ -65,29 +65,33 @@ class Solver:
 		best_mapping = None
 
 		# calculate cost for each placement group and submesh shape, and find the best one
+		# TODO: optimize by getting rid of redundant calculations
+		# TODO: auto_parallel different workloads
 		for g in G:
 			A_min = get_min_alloc(g, self.Q, self.N * self.M)
-			for submeshes in enum_submesh(self.N, self.M, A_min):
+			min_area = [model[2] for group in A_min for model in group]
+			for submeshes in enum_submesh_shapes(self.N, self.M, A_min):
 				l_parallel = {}
+				l_cost = {}
 				for i, group in enumerate(g):
 					device_mesh = LogicalDeviceMesh(submeshes[i]) # TODO: fix this part
 					for l in group:
-						l_parallel[l] = auto_parallel(l, A_min, self.W[l], device_mesh)
-				cost = self.compute_cost(g, l_parallel)
+						l_cost[l], l_parallel[l] = auto_parallel(l, A_min, self.W[l], device_mesh)
+				cost = self.compute_cost(g, l_cost)
 				if cost < best_cost:
 					best_cost = cost
 					best_mapping = (g, submeshes, l_parallel)
      
 		return best_mapping
 
-if __name__ == "__main__":
-    # Example usage
-	D = [(0, 1), (1, 2)] # example dataflow graph edges
-	L = [0, 1, 2] # example LLMs
-	W = {0: Workload(128, 128, "training"), 1: Workload(256, 256, "inference"), 2: Workload(512, 512, "generation")} # example workloads
-	N = 4 # number of servers
-	M = 8 # number of devices per server
-	Q = 40 # memory capacity per GPU in GB
+# if __name__ == "__main__":
+#     # Example usage
+# 	D = [(0, 1), (1, 2)] # example dataflow graph edges
+# 	L = [0, 1, 2] # example LLMs
+# 	W = {0: Workload(128, 128, "training"), 1: Workload(256, 256, "inference"), 2: Workload(512, 512, "generation")} # example workloads
+# 	N = 4 # number of servers
+# 	M = 8 # number of devices per server
+# 	Q = 40 # memory capacity per GPU in GB
 
-	solver = Solver(D, L, W, N, M, Q)
-	resource_pool_spec, mapping, parallelism_overrides = solver.solve()
+# 	solver = Solver(D, L, W, N, M, Q)
+# 	resource_pool_spec, mapping, parallelism_overrides = solver.solve()
