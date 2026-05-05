@@ -33,7 +33,9 @@ from verl.utils.device import auto_set_device, is_cuda_available
 from verl.utils.import_utils import load_extern_object
 from verl.trainer.ppo.auto_mapping.ray_config import get_topology
 from verl.trainer.ppo.auto_mapping.solver import Solver, Workload
+from verl.trainer.ppo.auto_mapping.mem_model import ModelSpec
 from verl.trainer.ppo.ray_trainer import ResourcePoolManager
+from verl.trainer.ppo.ray_trainer import Role
 
 
 @hydra.main(config_path="config", config_name="ppo_trainer", version_base=None)
@@ -280,11 +282,14 @@ class TaskRunner:
         D = [(i, i + 1) for i in range(len(roles) - 1)]
         Q = int(config.trainer.get("auto_mapping", {}).get("per_gpu_budget_gb", 80)) * 1024 ** 3
 
+        model_specs = self._build_model_specs(config, roles, prompt_len, response_len)
+
         solver = Solver(
             D=D, L=L, W=W,
             N=topology.num_hosts(), M=topology.gpus_per_host(), Q=Q,
             topology=topology,
             role_worker_mapping=self.role_worker_mapping,
+            model_specs=model_specs,
         )
         resource_pool_spec, mapping, overrides = solver.solve()
 
@@ -316,6 +321,60 @@ class TaskRunner:
         self.parallelism_overrides = overrides
 
         return ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=self.mapping)
+
+    def _build_model_specs(self, config, roles, prompt_len: int, response_len: int):
+        """Build per-role ModelSpec from HF configs for memory accounting.
+
+        Returns dict[role_id, ModelSpec], or None on failure (in which case
+        get_min_alloc falls back to the permissive stub).
+        """
+        try:
+            from transformers import AutoConfig
+        except ImportError:
+            return None
+
+        try:
+            actor_path = config.actor_rollout_ref.model.path
+            actor_cfg = AutoConfig.from_pretrained(actor_path, trust_remote_code=False)
+            critic_path = config.critic.model.path
+            critic_cfg = (
+                actor_cfg if critic_path == actor_path
+                else AutoConfig.from_pretrained(critic_path, trust_remote_code=False)
+            )
+        except Exception as e:
+            print(f"[auto_mapping] could not load HF configs ({e}); using permissive stub.")
+            return None
+
+        train_batch = int(config.actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu)
+
+        def _spec(hf_cfg, *, is_training: bool, is_generation: bool):
+            return ModelSpec(
+                num_layers=hf_cfg.num_hidden_layers,
+                hidden=hf_cfg.hidden_size,
+                num_attention_heads=hf_cfg.num_attention_heads,
+                num_kv_heads=getattr(hf_cfg, "num_key_value_heads", hf_cfg.num_attention_heads),
+                head_dim=hf_cfg.hidden_size // hf_cfg.num_attention_heads,
+                vocab=hf_cfg.vocab_size,
+                inter_size=hf_cfg.intermediate_size,
+                seq_len=(prompt_len + response_len) if is_training else prompt_len,
+                batch_per_gpu=train_batch,
+                is_training=is_training,
+                is_generation=is_generation,
+                response_len=response_len if is_generation else 0,
+            )
+
+        specs = {}
+        for i, role in enumerate(roles):
+            if role in (Role.Actor, Role.ActorRollout, Role.ActorRolloutRef):
+                # Hybrid engine: training + generation memory both accounted for
+                specs[i] = _spec(actor_cfg, is_training=True, is_generation=True)
+            elif role == Role.Critic:
+                specs[i] = _spec(critic_cfg, is_training=True, is_generation=False)
+            elif role in (Role.RefPolicy, Role.RewardModel):
+                specs[i] = _spec(actor_cfg, is_training=False, is_generation=False)
+            else:
+                specs[i] = _spec(actor_cfg, is_training=True, is_generation=False)
+        return specs
 
     def add_reward_model_resource_pool(self, config):
         """Add reward model worker if enabled."""

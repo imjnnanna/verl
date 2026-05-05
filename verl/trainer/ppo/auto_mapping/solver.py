@@ -49,7 +49,7 @@ class DataflowGraph:
         return self.stages[stage_idx]
     
 class Solver:
-	def __init__(self, D, L, W, N, M, Q, topology=None, role_worker_mapping=None):
+	def __init__(self, D, L, W, N, M, Q, topology=None, role_worker_mapping=None, model_specs=None):
 		self.D = D # DataflowGraph - dataflow graph of the RLHF pipeline
 		self.L = L # list[Role] - Roles in RLHF dataflow
 		self.W = W # dict[int, Workload] - workload of roles in RLHF dataflow
@@ -58,6 +58,7 @@ class Solver:
 		self.Q = Q # int - memory capacity per GPU
 		self.topology = topology # topology - physical bandwidth tiers; for ray_config export
 		self.role_worker_mapping = role_worker_mapping # dict[Role, WorkerType] - solver-id i in list(role_worker_mapping)[i]
+		self.model_specs = model_specs # dict[role_id, ModelSpec] - architecture+workload info for memory accounting
 	
 	def compute_cost(self, g, l_cost):
 		s = self.D.num_stages 
@@ -83,8 +84,8 @@ class Solver:
 		ap_cache = {}        # (l, min_area, h, w) -> (cost, parallel) from auto_parallel
 
 		for g in G:
-			A_min = get_min_alloc(g, self.Q, self.N * self.M)
-			min_area = tuple(model[2] for group in A_min for model in group)
+			A_min = get_min_alloc(g, self.Q, self.N * self.M, self.model_specs)
+			min_area = tuple(A_min[i].n for i in range(len(g)))
 
 			if min_area not in submesh_cache:
 				submesh_cache[min_area] = enum_submesh_shapes(self.N, self.M, list(min_area))
@@ -105,7 +106,7 @@ class Solver:
 					for l in group:
 						key = (l, min_area, h, w)
 						if key not in ap_cache:
-							ap_cache[key] = auto_parallel(l, A_min, self.W[l], device_mesh)
+							ap_cache[key] = auto_parallel(l, A_min[i], self.W[l], device_mesh)
 						l_cost[l], l_parallel[l] = ap_cache[key]
 				cost = self.compute_cost(g, l_cost)
 				if cost < best_cost:
