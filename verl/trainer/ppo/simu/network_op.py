@@ -35,8 +35,10 @@ class CombinedNetworkOp(NetworkOp):
     stages: list[NetworkOp]
 
     def __init__(self, stages: list[NetworkOp]):
-        self.stages = stages
-        self.logical_transfers = [] # Irrelevant for combined operations
+        # Frozen dataclass forbids attribute assignment after __init__ runs;
+        # bypass via object.__setattr__ to populate the inherited and own fields.
+        object.__setattr__(self, "stages", stages)
+        object.__setattr__(self, "logical_transfers", []) # Irrelevant for combined operations
 
     def get_operator_time(self, transfer_times: dict[LogicalTransfer, float]) -> float:
         total_time = 0.0
