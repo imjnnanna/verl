@@ -1,165 +1,206 @@
 from typing import List, Tuple
-# from enum import Enum
+from verl.trainer.ppo.utils import Role
 import math
 from functools import lru_cache
 
-# class Role(Enum):
-    # """
-    # To create more roles dynamically, you can subclass Role and add new members
-    # """
+def enum_placement_groups(L: List[Role], N_gpus: int, colocate_same_models=True) -> List[Tuple[Tuple[int, ...], ...]]:
+    '''
+    Enumerate all Bell partitions of models into colocated placement groups.
 
-    # Actor = 0
-    # Rollout = 1
-    # ActorRollout = 2
-    # Critic = 3
-    # RefPolicy = 4
-    # RewardModel = 5
-    # ActorRolloutRef = 6
-    # Env = 7
-    # TeacherModel = 8
+    When colocate_same_models=True, any two roles that are both actors (is_actor())
+    or both refs (is_ref()) are forced into the same placement group.
 
-    # def __str__(self):
-    #     return self._get_role_string()
+    Returns:
+        List of groups:
+            ((model_id, ...), ...) - each inner tuple is a colocated group of models
+    '''
+    n = len(L)
 
-    # def _get_role_string(self):
-    #     role_mapping = {
-    #         Role.Actor: "actor",
-    #         Role.Rollout: "rollout",
-    #         Role.ActorRollout: "actor_rollout",
-    #         Role.Critic: "critic",
-    #         Role.RefPolicy: "ref",
-    #         Role.RewardModel: "rm",
-    #         Role.ActorRolloutRef: "actor_rollout_ref",
-    #         Role.TeacherModel: "teacher",
-    #     }
-    #     return role_mapping.get(self, self.name.lower())
+    # Build must-colocate adjacency: pairs that must share a group.
+    must_colocate: List[set] = [set() for _ in range(n)]
+    if colocate_same_models:
+        for i in range(n):
+            for j in range(i + 1, n):
+                if (L[i].is_actor() and L[j].is_actor()) or (L[i].is_ref() and L[j].is_ref()):
+                    must_colocate[i].add(j)
+                    must_colocate[j].add(i)
 
-    # @classmethod
-    # def from_string(cls, name: str):
-    #     string_mapping = {
-    #         "actor": cls.Actor,
-    #         "rollout": cls.Rollout,
-    #         "actor_rollout": cls.ActorRollout,
-    #         "critic": cls.Critic,
-    #         "ref": cls.RefPolicy,
-    #         "rm": cls.RewardModel,
-    #         "actor_rollout_ref": cls.ActorRolloutRef,
-    #     }
-    #     role = string_mapping.get(name.lower())
-    #     if role is None:
-    #         raise ValueError(f"No Role found for string: {name}")
-    #     return role
-
-
-
-def enum_placement_groups(L: List[int], N_gpus: int) -> List[Tuple[Tuple[int, ...], ...]]:
-    # enumerate all Bell partitions of models into colocated placement groups
     placements = []
-    
-    def backtrack(i: int, groups: List[List]) -> None:
-        # print(f"Backtracking: i={i}, groups={groups}")
-        if i == len(L):
+    model_to_group: List[int] = [-1] * n
+
+    def backtrack(i: int, groups: List[List[int]]) -> None:
+        if i == n:
             placements.append(tuple(tuple(group) for group in groups))
             return
-        
-        for group in groups:
-            group.append(i)
+
+        # Determine if any already-placed partner constrains which group i must join.
+        required_group = None
+        for j in must_colocate[i]:
+            if model_to_group[j] == -1:
+                continue
+            if required_group is None:
+                required_group = model_to_group[j]
+            elif required_group != model_to_group[j]:
+                # Partners already split across groups — infeasible branch.
+                return
+
+        if required_group is not None:
+            # i must join the group that contains its already-placed partners.
+            groups[required_group].append(i)
+            model_to_group[i] = required_group
             backtrack(i + 1, groups)
-            group.pop()
-        
-        if len(groups) < N_gpus:
-            groups.append([i])
-            backtrack(i + 1, groups)
-            groups.pop()
-            
+            groups[required_group].pop()
+            model_to_group[i] = -1
+        else:
+            # No placed partners yet: i can join any existing group or start a new one.
+            for g_idx, group in enumerate(groups):
+                group.append(i)
+                model_to_group[i] = g_idx
+                backtrack(i + 1, groups)
+                group.pop()
+                model_to_group[i] = -1
+
+            if len(groups) < N_gpus:
+                groups.append([i])
+                model_to_group[i] = len(groups) - 1
+                backtrack(i + 1, groups)
+                groups.pop()
+                model_to_group[i] = -1
+
     backtrack(0, [])
     return placements
 
-def valid_submeshes(n: int, m: int, min_area: int) -> List[Tuple[int, int]]:
+def valid_submeshes(N: int, M: int, min_area: int) -> List[Tuple[int, int]]:
+    # print(f"Finding valid submeshes for N={N}, M={M}, min_area={min_area}")
     submeshes = []
+    
+    # if M not power of 2
+    log2M = int(math.log2(M)) if M > 0 else 0
+    if M >= min_area and (1 << log2M) != M:
+        submeshes.append((1, M))
 
     # 1-row submeshes: (1, 1), ..., (1, m)
-    for w in range(0, int(math.log2(m)) + 1):
-        if 2**w >= min_area:
-            submeshes.append((1, 2**w))
+    for w in range(log2M, -1, -1):
+        if 2**w < min_area:
+            break
+        submeshes.append((1, 2**w))
+        # print(f"Added 1-row submesh: (1, {2**w})")
 
     # full-width multi-row submeshes: (2, m), ..., (n, m)
-    for h in range(2, n + 1):
-        if h * m >= min_area:
-            submeshes.append((h, m))
-
+    for h in range(N, 1, -1):
+        if h * M < min_area:
+            break
+        submeshes.append((h, M))
+        # print(f"Added full-width submesh: ({h}, {M})")
+            
     return submeshes
     
-def enum_submesh_shapes(
-    n: int,
-    m: int,
-    a_min: List[int],
-):
+def enum_submesh_shapes(N: int, M: int, A_min: List[int]) -> List[List[Tuple[int, int]]]:
     """
-    Assign each element a rectangular chunk that fits inside an n x m grid.
+    For each of the colocated groups, assign each element a rectangular submesh that fits inside an N x M grid.
 
-    Allowed chunk shapes:
-        (1, 1), (1, 2), ..., (1, m)
-        (2, m), (3, m), ..., (n, m)
+    Allowed submesh shapes:
+        (1, 1), (1, 2), (1, 4), ..., (1, M) - one-row submeshes with widths that are powers of 2
+        (2, M), (3, M), (2, M), ..., (N, M) - full nodes
 
     Constraint:
-        chunk_area >= a_min[i]
+        n_i * m_i >= A_min[i]
 
     Returns:
-        List of placements:
-            (top_row, left_col, height, width)
-        or None if infeasible.
+        List of device mesh shapes:
+            (n_i, m_i)
     """
-    K = len(a_min)
+    K = len(A_min)
+    total_area = N * M
+    
+    if sum(A_min) > total_area:
+        return []
+
+    shapes_by_i = [
+        valid_submeshes(N, M, A_min[i])
+        for i in range(K)
+    ]
 
     @lru_cache(None)
-    def dp(i: int, row_used: Tuple[int, ...]):
+    def dp(
+        i: int,
+        row_used: Tuple[int, ...],
+        area_used: int,
+    ) -> Tuple[Tuple[Tuple[int, int], ...], ...]:
         if i == K:
+            if area_used == total_area and all(x == M for x in row_used):
+                return ((),)
             return ()
 
-        for h, w in valid_submeshes(n, m, a_min[i][0][0]):
-            # Case 1: one-row submesh
-            if h == 1:
-                for row in range(n):
-                    if row_used[row] + w <= m:
-                        left_col = row_used[row]
+        # Prune: already overfilled by area.
+        if area_used > total_area:
+            return ()
 
+        # Prune: even using minimum required areas, cannot fit exactly anymore.
+        remaining_min_area = sum(A_min[i:])
+        if area_used + remaining_min_area > total_area:
+            return ()
+
+        results = set()
+
+        for h, w in shapes_by_i[i]:
+            shape_area = h * w
+
+            if area_used + shape_area > total_area:
+                continue
+
+            if h == 1:
+                # Place one-row chunk into any row with enough remaining width.
+                for row in range(N):
+                    if row_used[row] + w <= M:
                         new_row_used = list(row_used)
                         new_row_used[row] += w
-                        new_row_used_tuple = tuple(new_row_used)
+                        new_state = tuple(new_row_used)
 
-                        rest = dp(i + 1, new_row_used_tuple)
-                        if rest is not None:
-                            placement = (h, w)
-                            return (placement,) + rest
-            # Case 2: full-width multi-row chunk.
+                        suffixes = dp(
+                            i + 1,
+                            new_state,
+                            area_used + shape_area,
+                        )
+
+                        for suffix in suffixes:
+                            results.add(((h, w),) + suffix)
+
             else:
-                # Need h completely empty rows.
-                for start_row in range(n - h + 1):
+                # Place full-width h-row chunk.
+                # Requires h completely empty contiguous rows.
+                for start_row in range(N - h + 1):
                     rows = range(start_row, start_row + h)
 
                     if all(row_used[r] == 0 for r in rows):
                         new_row_used = list(row_used)
 
                         for r in rows:
-                            new_row_used[r] = m
+                            new_row_used[r] = M
 
-                        new_row_used_tuple = tuple(new_row_used)
+                        new_state = tuple(new_row_used)
 
-                        rest = dp(i + 1, new_row_used_tuple)
-                        if rest is not None:
-                            placement = (h, w)
-                            return (placement,) + rest
+                        suffixes = dp(
+                            i + 1,
+                            new_state,
+                            area_used + shape_area,
+                        )
 
-        return None
+                        for suffix in suffixes:
+                            results.add(((h, w),) + suffix)
 
-    initial_state = tuple([0] * n)
-    result = dp(0, initial_state)
+        return tuple(sorted(results))
 
+    initial_row_used = tuple([0] * N)
+    tilings = dp(0, initial_row_used, 0)
+
+    return [list(t) for t in tilings]
+
+def enum_submesh(n, m, a_min):
+    result = enum_submesh_shapes(n, m, a_min)
     if result is None:
-        return None
-
-    return list(result)
+        return
+    yield from result
 
 def enum_submesh(n, m, a_min):
     result = enum_submesh_shapes(n, m, a_min)
@@ -168,7 +209,7 @@ def enum_submesh(n, m, a_min):
     yield list(result)
 
 # if __name__ == "__main__":
-#     L = [Role.Actor, Role.Critic, Role.RefPolicy]
-#     N_gpus = 2
-#     placements = enum_placement_groups(L, N_gpus)
-#     print(placements)
+#     L = [Role.Actor, Role.Rollout, Role.Critic, Role.RefPolicy]
+#     N = 3
+    
+#     print(enum_placement_groups(L, N, colocate_same_models=True))
