@@ -47,7 +47,7 @@ def export_solver_result(
             role = roles[role_id]
             mapping[role] = pool_name
             if role_id in l_parallel:
-                _, (p, t, d) = l_parallel[role_id]
+                p, t, d = l_parallel[role_id]
                 overrides[role] = _parallelism_keys_for_role(role, p=p, t=t, d=d)
 
     return resource_pool_spec, mapping, overrides

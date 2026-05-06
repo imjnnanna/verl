@@ -32,7 +32,7 @@ from verl.utils.config import validate_config
 from verl.utils.device import auto_set_device, is_cuda_available
 from verl.utils.import_utils import load_extern_object
 from verl.trainer.ppo.auto_mapping.ray_config import get_topology
-from verl.trainer.ppo.auto_mapping.solver import Solver, Workload
+from verl.trainer.ppo.auto_mapping.solver import Solver, Workload, DataflowGraph
 from verl.trainer.ppo.auto_mapping.mem_model import ModelSpec
 from verl.trainer.ppo.ray_trainer import ResourcePoolManager
 from verl.trainer.ppo.ray_trainer import Role
@@ -274,12 +274,20 @@ class TaskRunner:
 
         topology = get_topology(config)
         roles = list(self.role_worker_mapping.keys())
-        L = list(range(len(roles)))
+        # enum_placement_groups expects Role members (uses .is_actor() / .is_ref()).
+        # Output tuples are still integer indices into L, so W/model_specs keep int keys.
+        L = roles
         prompt_len = int(config.data.get("max_prompt_length", 1024))
         response_len = int(config.data.get("max_response_length", 1024))
         # TODO: differentiate compute_type per role (after simulators support per-role compute_type)
-        W = {i: Workload(prompt_len, response_len, "training") for i in L}
-        D = [(i, i + 1) for i in range(len(roles) - 1)]
+        # W is keyed by integer index (matching enum_placement_groups's output indexing).
+        W = {i: Workload(prompt_len, response_len, "training") for i in range(len(roles))}
+        # TODO: build real multi-stage dataflow (gen / prep / train). For now, single
+        # stage that contains every role -- compute_cost sums l_costs across all roles.
+        D = DataflowGraph(
+            edges=[(i, i + 1) for i in range(len(roles) - 1)],
+            stages=[list(range(len(roles)))],
+        )
         Q = int(config.trainer.get("auto_mapping", {}).get("per_gpu_budget_gb", 80)) * 1024 ** 3
 
         model_specs = self._build_model_specs(config, roles, prompt_len, response_len)
@@ -319,6 +327,10 @@ class TaskRunner:
 
         self.mapping = mapping
         self.parallelism_overrides = overrides
+
+        print(f"[auto_mapping] resource_pool_spec={resource_pool_spec}")
+        print(f"[auto_mapping] mapping={mapping}")
+        print(f"[auto_mapping] parallelism_overrides={overrides}")
 
         return ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=self.mapping)
 
