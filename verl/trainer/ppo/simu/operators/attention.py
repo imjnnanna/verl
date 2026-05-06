@@ -1,6 +1,8 @@
 from __future__ import annotations
 from dataclasses import dataclass
+from typing import Optional
 
+from verl.trainer.ppo.simu.hardware import HardwareSpec
 from verl.trainer.ppo.simu.operator import Operator
 from verl.trainer.ppo.simu.workload_context import WorkloadContext
 
@@ -17,8 +19,8 @@ class PrefillAttention(Operator):
       compute_flops = 2 * num_heads * head_size * t2
       memory_bytes  = 3 * num_heads * head_size * t2 / flash_block_size * dtype_bytes
 
-    Always memory-bound on A100: AI = 2 * flash_block_size / (3 * dtype_bytes)
-    ~= 21 for b=64, dtype=2 — far below the 156 ridge.
+    Always memory-bound on A100/H100: AI = 2 * flash_block_size / (3 * dtype_bytes)
+    ~= 21 for b=64, dtype=2 — far below the FP16 roofline ridge of either GPU.
     """
 
     num_heads: int
@@ -42,7 +44,7 @@ class PrefillAttention(Operator):
             * self.dtype_bytes
         )
 
-    def is_compute_bound(self, ctx: WorkloadContext) -> bool:
+    def is_compute_bound(self, ctx: WorkloadContext, hw: HardwareSpec) -> bool:
         return False  # FlashAttention prefill is memory-bound on A100/H100
 
 
@@ -52,21 +54,33 @@ class DecodeAttention(Operator):
     attending over the running KV cache.
 
     Per request:
-      compute: 2 * num_heads     * head_size * avg_context_length  (sum over query heads)
-      memory:  3 * num_kv_heads  * head_size * avg_context_length * dtype_bytes
-               (K + V reads dominate; output write rolled into the 3x factor)
+      compute: 2 * num_heads * head_size * avg_context_length  (sum over query heads)
+      memory:  batch * avg_context_length * kv_bytes_per_token  (K + V reads dominate)
 
     avg_context_length = prompt_len + response_len/2, the mean attended length
     over a uniform decode trajectory.
 
-    Always memory-bound: AI = 2 * num_heads / (3 * num_kv_heads * dtype_bytes)
-    ~= 1.3 for Llama-3 GQA (32/8) at FP16.
+    kv_bytes_per_token defaults to 2 * num_kv_heads * head_size * dtype_bytes
+    (full GQA K + V reads). MLA overrides this to (d_kv_compress + d_rope) *
+    dtype_bytes — its compressed-latent KV cache is the dominant memory win.
+
+    Always memory-bound on A100/H100 for any reasonable GQA/MLA shape.
     """
 
     num_heads: int
     num_kv_heads: int
     head_size: int
     dtype_bytes: int = 2
+    # Resolved in __post_init__ when None (default GQA formula).
+    kv_bytes_per_token: Optional[int] = None
+
+    def __post_init__(self) -> None:
+        if self.kv_bytes_per_token is None:
+            object.__setattr__(
+                self,
+                "kv_bytes_per_token",
+                2 * self.num_kv_heads * self.head_size * self.dtype_bytes,
+            )
 
     @staticmethod
     def avg_context_length(ctx: WorkloadContext) -> float:
@@ -80,10 +94,8 @@ class DecodeAttention(Operator):
 
     def memory_bytes(self, ctx: WorkloadContext) -> float:
         return (
-            3.0 * self.num_kv_heads * self.head_size
-            * self.avg_context_length(ctx) * ctx.batch_size
-            * self.dtype_bytes
+            ctx.batch_size * self.avg_context_length(ctx) * self.kv_bytes_per_token
         )
 
-    def is_compute_bound(self, ctx: WorkloadContext) -> bool:
+    def is_compute_bound(self, ctx: WorkloadContext, hw: HardwareSpec) -> bool:
         return False

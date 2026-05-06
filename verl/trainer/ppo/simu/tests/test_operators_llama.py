@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from verl.trainer.ppo.simu.hardware import HardwareSpec
 from verl.trainer.ppo.simu.operators.attention import PrefillAttention
 from verl.trainer.ppo.simu.operators.composite import (
     Repeat,
@@ -15,6 +16,14 @@ from verl.trainer.ppo.simu.workload_context import (
     TokenCount,
     Workload,
     WorkloadContext,
+)
+
+
+# A100-style synthetic spec — only ridge_flops_per_byte affects is_compute_bound.
+A100 = HardwareSpec(
+    peak_compute_flops=312e12,        # FP16 peak
+    peak_memory_bandwidth=2.0e12,     # ~2 TB/s HBM
+    ridge_flops_per_byte=156.0,
 )
 
 
@@ -87,12 +96,13 @@ def test_prefill_attention_is_memory_bound():
         dtype_bytes=LLAMA3_8B.dtype_bytes,
     )
     ctx = _prefill_ctx(batch=1, prompt_len=2048)
-    assert not attn.is_compute_bound(ctx)
+    assert not attn.is_compute_bound(ctx, A100)
 
-    # Sanity-check the analytical AI: 2 * b / (3 * dtype_bytes).
+    # Sanity-check the analytical AI: 2 * b / (3 * dtype_bytes), well below the ridge.
     ai = attn.compute_flops(ctx) / attn.memory_bytes(ctx)
     expected_ai = 2.0 * LLAMA3_8B.flash_block_size / (3.0 * LLAMA3_8B.dtype_bytes)
     assert ai == pytest.approx(expected_ai)
+    assert ai < A100.ridge_flops_per_byte
 
 
 def test_qkv_gemm_is_compute_bound_at_prompt_2048():
@@ -104,7 +114,7 @@ def test_qkv_gemm_is_compute_bound_at_prompt_2048():
         dtype_bytes=LLAMA3_8B.dtype_bytes,
     )
     ctx = _prefill_ctx(batch=1, prompt_len=2048)
-    assert qkv.is_compute_bound(ctx)
+    assert qkv.is_compute_bound(ctx, A100)
     # And the ridge boundary: at very small M (single decode token) the same
     # GEMM flips memory-bound.
     decode_qkv = Gemm(
@@ -121,4 +131,4 @@ def test_qkv_gemm_is_compute_bound_at_prompt_2048():
         response_len=128,
         num_microbatches=1,
     )
-    assert not decode_qkv.is_compute_bound(decode_ctx)
+    assert not decode_qkv.is_compute_bound(decode_ctx, A100)

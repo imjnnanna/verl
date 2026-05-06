@@ -1,15 +1,35 @@
 from __future__ import annotations
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import ClassVar, Optional
 
 from verl.trainer.ppo.simu.model_mapping import ModelMapping
+from verl.trainer.ppo.simu.relation import NetworkPhase
 from verl.trainer.ppo.simu.shard import Shard
 from verl.trainer.ppo.simu.topo import HostTopo
 
 @dataclass(frozen=True)
 class NetworkOp(ABC):
     logical_transfers: list[LogicalTransfer]
+    # Per-instance contention class. Defaults to the subclass's DEFAULT_PHASE
+    # (resolved in __post_init__) so the common case stays ergonomic, but any
+    # call site can override — e.g. a P2P used as pipeline send/recv that
+    # contends as a steady-state stream rather than a boundary one-shot.
+    # kw_only so that @dataclass subclasses can still add positional fields
+    # without defaults (CombinedNetworkOp.stages).
+    phase: Optional[NetworkPhase] = field(default=None, kw_only=True)
+
+    # Subclasses set this to declare the typical phase for the op type.
+    # None means the caller MUST pass `phase=` explicitly.
+    DEFAULT_PHASE: ClassVar[Optional[NetworkPhase]] = None
+
+    def __post_init__(self) -> None:
+        if self.phase is None and self.DEFAULT_PHASE is not None:
+            object.__setattr__(self, "phase", self.DEFAULT_PHASE)
+
+    @staticmethod
+    def phase_of(op: NetworkOp) -> Optional[NetworkPhase]:
+        return op.phase
 
     @staticmethod
     def time_simultaneous_system_flow(ops: list[NetworkOp], topo: HostTopo) -> list[float]:
@@ -34,11 +54,14 @@ class NetworkOp(ABC):
 class CombinedNetworkOp(NetworkOp):
     stages: list[NetworkOp]
 
-    def __init__(self, stages: list[NetworkOp]):
+    def __init__(self, stages: list[NetworkOp], phase: Optional[NetworkPhase] = None):
         # Frozen dataclass forbids attribute assignment after __init__ runs;
         # bypass via object.__setattr__ to populate the inherited and own fields.
+        # phase has no natural default for a composite (sub-stages may differ),
+        # so callers pass one explicitly when they need phase_of() to resolve.
         object.__setattr__(self, "stages", stages)
         object.__setattr__(self, "logical_transfers", []) # Irrelevant for combined operations
+        object.__setattr__(self, "phase", phase)
 
     def get_operator_time(self, transfer_times: dict[LogicalTransfer, float]) -> float:
         total_time = 0.0
@@ -48,6 +71,8 @@ class CombinedNetworkOp(NetworkOp):
         return total_time
 
 class AllReduceRing(NetworkOp):
+    DEFAULT_PHASE = NetworkPhase.STEADY
+
     @classmethod
     def generate(cls, model_mapping: ModelMapping, shards_ring: list[Shard], data_GB: float) -> AllReduceRing:
         """
@@ -73,6 +98,8 @@ class AllReduceRing(NetworkOp):
         return max_time * 2 * (n - 1) if n > 0 else 0.0
 
 class AllGatherRing(NetworkOp):
+    DEFAULT_PHASE = NetworkPhase.STEADY
+
     @classmethod
     def generate(cls, model_mapping: ModelMapping, shards_ring: list[Shard], data_GB: float) -> AllGatherRing:
         """
@@ -98,6 +125,8 @@ class AllGatherRing(NetworkOp):
         return max_time * (n - 1) if n > 0 else 0.0
 
 class ReduceScatterRing(NetworkOp):
+    DEFAULT_PHASE = NetworkPhase.STEADY
+
     @classmethod
     def generate(cls, model_mapping: ModelMapping, shards_ring: list[Shard], data_GB: float) -> ReduceScatterRing:
         """
@@ -115,6 +144,8 @@ class ReduceScatterRing(NetworkOp):
         return max_time * (n - 1) if n > 0 else 0.0
 
 class AllToAll(NetworkOp):
+    DEFAULT_PHASE = NetworkPhase.STEADY
+
     @classmethod
     def generate(cls, model_mapping: ModelMapping, shards: list[Shard], data_GB: float) -> AllToAll:
         logical_transfers = []
@@ -136,6 +167,8 @@ class AllToAll(NetworkOp):
         return max(transfer_times.get(t, 0.0) for t in self.logical_transfers)
 
 class Broadcast(NetworkOp):
+    DEFAULT_PHASE = NetworkPhase.BOUNDARY
+
     @classmethod
     def generate(cls, model_mapping: ModelMapping, src_shard: Shard, dst_shards: list[Shard], data_GB: float) -> Broadcast:
         logical_transfers = []
@@ -155,6 +188,8 @@ class Broadcast(NetworkOp):
         return max(transfer_times.get(t, 0.0) for t in self.logical_transfers)
 
 class P2P(NetworkOp):
+    DEFAULT_PHASE = NetworkPhase.BOUNDARY
+
     @classmethod
     def generate(cls, model_mapping: ModelMapping, src_shard: Shard, dst_shard: Shard, data_GB: float) -> P2P:
         return cls(logical_transfers=[LogicalTransfer(

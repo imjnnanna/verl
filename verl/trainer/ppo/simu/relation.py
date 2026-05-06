@@ -1,8 +1,12 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
+from typing import TYPE_CHECKING
 
-from verl.trainer.ppo.simu.network_op import NetworkOp
+if TYPE_CHECKING:
+    # Imported only for type-checking. The runtime import is deferred to break
+    # a cycle: network_op.py imports NetworkPhase from this module.
+    from verl.trainer.ppo.simu.network_op import NetworkOp
 
 
 class Relation(Enum):
@@ -10,9 +14,14 @@ class Relation(Enum):
     CONCURRENT = "concurrent"
 
 
+class NetworkPhase(Enum):
+    STEADY = "steady"      # repeats throughout a stage; bandwidth-shared contention
+    BOUNDARY = "boundary"  # one-shot at stage edges; flow-time contention
+
+
 @dataclass(frozen=True)
 class NetworkAssociation:
-    network_op: NetworkOp
+    network_op: "NetworkOp"
     relation: Relation
     eta: float = 1.0  # overlap efficiency, only used when relation is CONCURRENT.
                       # 1.0 = perfect overlap (max), 0.0 = no overlap (sum).

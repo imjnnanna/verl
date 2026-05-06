@@ -90,5 +90,11 @@ class Repeat:
         return list(self.operators) * self.count
 
 
-def expand_layers(layers: list[Repeat]) -> list[Operator]:
-    return [op for r in layers for op in r.expand()]
+def expand_layers(layers: list[Operator | Repeat]) -> list[Operator]:
+    out: list[Operator] = []
+    for item in layers:
+        if isinstance(item, Repeat):
+            out.extend(item.expand())
+        else:
+            out.append(item)
+    return out

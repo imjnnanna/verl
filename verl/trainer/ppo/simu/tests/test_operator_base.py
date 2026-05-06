@@ -20,7 +20,7 @@ class ConcreteOp(Operator):
     def memory_bytes(self, ctx: WorkloadContext) -> float:
         return self.bytes_
 
-    def is_compute_bound(self, ctx: WorkloadContext) -> bool:
+    def is_compute_bound(self, ctx: WorkloadContext, hw: HardwareSpec) -> bool:
         # Not used by the base-class smoke tests; just a stable definition.
         return self.flops >= self.bytes_
 
@@ -43,6 +43,7 @@ def hw() -> HardwareSpec:
     return HardwareSpec(
         peak_compute_flops=1e15,
         peak_memory_bandwidth=1e12,
+        ridge_flops_per_byte=156.0,
         compute_efficiency=0.5,
         memory_efficiency=0.5,
         small_gemm_efficiency=0.25,

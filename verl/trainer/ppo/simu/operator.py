@@ -20,7 +20,7 @@ class Operator(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def is_compute_bound(self, ctx: WorkloadContext) -> bool:
+    def is_compute_bound(self, ctx: WorkloadContext, hw: HardwareSpec) -> bool:
         raise NotImplementedError
 
     def is_small_dim(self, ctx: WorkloadContext) -> bool:
@@ -37,3 +37,13 @@ class Operator(ABC):
 
     def kernel_time(self, ctx: WorkloadContext, hw: HardwareSpec) -> float:
         return max(self.compute_time(ctx, hw), self.memory_time(ctx, hw))
+
+    # Static parameter accounting. Default to zero so timing-only ops don't
+    # need to override; weight-bearing ops (Gemm, TokenEmbedding) override to
+    # report N*K*dtype etc. activated_parameter_bytes diverges from
+    # parameter_bytes only for sparse-activation ops (MoE experts).
+    def parameter_bytes(self) -> int:
+        return 0
+
+    def activated_parameter_bytes(self) -> int:
+        return self.parameter_bytes()
