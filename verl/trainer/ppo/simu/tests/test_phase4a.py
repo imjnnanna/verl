@@ -150,7 +150,7 @@ def test_simulate_pp2_partition_and_stage_times():
     assert result.total_time > 0.0
 
 
-def test_training_includes_backward_and_optimizer():
+def test_training_includes_backward_and_per_layer_optimizer():
     mm = _make_mapping(Workload.TRAINING, ParallelismConfig(tp=2, pp=1, dp=1, ep=1))
 
     backward_ops = [op for op in mm.operator_pattern if isinstance(op, BackwardOp)]
@@ -165,8 +165,108 @@ def test_training_includes_backward_and_optimizer():
         assert bwd_flops == pytest.approx(3.0 * fwd_flops)
 
     optimizers = [op for op in mm.operator_pattern if isinstance(op, AdamOptimizerOp)]
-    assert len(optimizers) == 1
-    assert optimizers[0].num_parameters > 0
+    # One per LayerTag with non-zero parameters: n_layers numeric tags +
+    # boundary tags (first=embed, last=final_norm+lm_head).
+    expected_min = SMALL_LLAMA.n_layers
+    assert len(optimizers) >= expected_min, (
+        f"expected at least {expected_min} per-layer optimizers, got {len(optimizers)}"
+    )
+    assert all(op.num_parameters > 0 for op in optimizers)
+
+
+def test_pp_partition_co_locates_forward_and_backward_per_layer():
+    """Each layer's forward and backward operators must land in the same stage.
+
+    Even-by-op-count partitioning (the bug this replaces) put forward of
+    layer N on stage 0 and backward of layer N on stage 1, which violates
+    real PP — backward needs the activations and weights stored locally
+    after the corresponding forward.
+    """
+    mm = _make_mapping(Workload.TRAINING, ParallelismConfig(tp=2, pp=2, dp=1, ep=1))
+
+    # For each op-index, find its layer tag, then its assigned stage.
+    op_to_stage: dict[int, int] = {}
+    for stage_idx, op_indices in enumerate(mm.pipeline_partition):
+        for i in op_indices:
+            op_to_stage[i] = stage_idx
+
+    # Group op indices by (layer_index, anchor) tag.
+    by_tag: dict[tuple, list[int]] = {}
+    for i, tag in enumerate(mm.per_op_layer_tags):
+        key = (tag.layer_index, tag.anchor)
+        by_tag.setdefault(key, []).append(i)
+
+    # Every op in a tag group must share a stage.
+    for key, indices in by_tag.items():
+        stages = {op_to_stage[i] for i in indices}
+        assert len(stages) == 1, (
+            f"layer tag {key} spans multiple stages {stages}; forward and "
+            f"backward of the same layer must co-locate"
+        )
+
+
+def test_pp_partition_v3_balances_cost():
+    """V3 with 3 dense + 58 MoE layers and PP=4 should produce roughly balanced
+    stage costs (per-layer kernel_time at the reference workload). Dense layers
+    are much cheaper than MoE; cost-balanced partition naturally clusters
+    several dense layers on one stage while spreading MoE across the rest."""
+    from verl.trainer.ppo.simu.operators.v3_block import build_v3_pattern
+    from verl.trainer.ppo.simu.operators.v3_config import V3Config
+
+    arch = V3Config()
+    model = Model(
+        name="v3_small",
+        role="actor",
+        architecture=arch,
+        build_pattern=build_v3_pattern,
+    )
+    parallelism = ParallelismConfig(tp=1, pp=4, dp=1, ep=1)
+    shards: list[Shard] = []
+    s2h: dict[Shard, int] = {}
+    h2s: dict[int, Shard] = {}
+    host = 0
+    for d in range(parallelism.dp):
+        for p in range(parallelism.pp):
+            for t in range(parallelism.tp):
+                s = Shard(model=model, dp=d, pp=p, tp=t)
+                shards.append(s)
+                s2h[s] = host
+                h2s[host] = s
+                host += 1
+    mesh = Mesh(host_ids=list(range(host)), num_devices_per_host=1)
+    mm = ModelMapping(
+        model=model,
+        mesh=mesh,
+        workload=Workload.PREPARATION,
+        parallelism=parallelism,
+        shards_to_host_ids=s2h,
+        host_id_to_shard=h2s,
+    )
+
+    # Compute per-stage cost at the reference workload the partitioner used.
+    from verl.trainer.ppo.simu.model_mapping import _PARTITION_REF_HW
+    ref_ctx = mm._reference_partition_ctx()
+    stage_costs = [
+        sum(
+            mm.operator_pattern[i].kernel_time(ref_ctx, _PARTITION_REF_HW)
+            for i in op_indices
+        )
+        for op_indices in mm.pipeline_partition
+    ]
+
+    assert len(stage_costs) == 4
+    # All stages should have non-zero work (no empty stage with 4 stages and
+    # 61 layers + boundary ops).
+    assert all(c > 0 for c in stage_costs)
+
+    # Balance check: the maximum stage cost should not exceed the minimum by
+    # more than ~1.5×. Compare to the even-by-count partition the old code
+    # produced, which on V3 had max/min much worse than this.
+    max_cost = max(stage_costs)
+    min_cost = min(stage_costs)
+    assert max_cost / min_cost < 1.5, (
+        f"PP partition imbalanced: stage_costs={stage_costs}, max/min={max_cost/min_cost:.2f}"
+    )
 
 
 def test_generation_simulate_returns_prefill_and_decode():

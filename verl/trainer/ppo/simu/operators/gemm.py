@@ -54,6 +54,27 @@ class Gemm(Operator):
     def is_small_dim(self, ctx: WorkloadContext) -> bool:
         return min(self._m(ctx), float(self.n), float(self.k)) < 1024
 
+    def is_gemv(self, ctx: WorkloadContext) -> bool:
+        """True for GEMV-shaped GEMMs (M < 16). Decode steps with batch=1
+        produce M=1 GEMMs with K, N >> 1024 — these miss `is_small_dim` (since
+        only M is small) but have fundamentally GEMV-style efficiency.
+        """
+        return self._m(ctx) < 16
+
+    # Three-tier efficiency selection: GEMV < small_dim < normal. GEMV takes
+    # precedence over small_dim because GEMV is a stricter shape constraint.
+    def compute_efficiency_factor(self, ctx: WorkloadContext, hw: HardwareSpec) -> float:
+        if self.is_gemv(ctx):
+            return hw.gemv_efficiency
+        if self.is_small_dim(ctx):
+            return hw.small_gemm_efficiency
+        return hw.compute_efficiency
+
+    def memory_efficiency_factor(self, ctx: WorkloadContext, hw: HardwareSpec) -> float:
+        if self.is_gemv(ctx):
+            return hw.gemv_memory_efficiency
+        return hw.memory_efficiency
+
     def parameter_bytes(self) -> int:
         return self.n_replicas * self.n * self.k * self.dtype_bytes
 

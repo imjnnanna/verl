@@ -148,6 +148,15 @@ Default values (literature-typical):
 | `compute_efficiency` | 0.7 | achieved fraction of peak FLOPs for large GEMMs |
 | `memory_efficiency` | 0.8 | achieved fraction of peak HBM bandwidth |
 | `small_gemm_efficiency` | 0.4 | replaces compute_efficiency when min(M,N,K) < 1024 |
+| `gemv_efficiency` | 0.3 | replaces compute_efficiency when M < 16 (decode GEMVs) |
+| `gemv_memory_efficiency` | 0.65 | replaces memory_efficiency when M < 16 |
+
+The GEMV tier (`Gemm.is_gemv(ctx)` triggers when M < 16, taking precedence
+over `is_small_dim`) exists because batch=1 decode produces M=1 GEMMs with
+K, N >> 1024 — which miss `is_small_dim`'s threshold but have fundamentally
+GEMV-style efficiency characteristics. Only `Gemm` consults the GEMV tier;
+attention, RMSNorm, RoPE, etc. use the base `compute_efficiency` /
+`memory_efficiency` directly.
 
 To improve accuracy on a specific deployment, profile representative
 operator shapes and replace the defaults. `validation/findings.md` lists
@@ -206,17 +215,23 @@ g. **Submesh-local simulation mode** (`SubmeshMapping.simulate_isolated`)
 h. **Submesh-local mode and stage-level simulation can disagree.** When
    stage-wide information is available, prefer `simulate_stage`.
 
-i. **PP partitioning is even-by-op-count.** For training patterns where
-   forward and backward run sequentially, this puts backward (3× heavier)
-   in a single stage and unbalances `max_stage_time`. Cost-balanced
-   partitioning is a deferred TODO; it's the dominant cause of the
-   training-step over-prediction in the validation harness.
+i. **GEMV efficiency is a rough default.** `gemv_efficiency=0.3` and
+   `gemv_memory_efficiency=0.65` are literature-typical numbers; real
+   kernels vary by 1.5-2× depending on M, K, N, and the actual GEMV
+   library used. For production accuracy, profile a representative
+   GEMV kernel (M=1, your decode K/N) on the target hardware and update
+   `HardwareSpec`. The brief's per-scenario fitting is a sounder route
+   than tweaking the global default.
 
-j. **Pure-roofline scope.** The simulator does not model kernel-launch
-   overhead, allocator/dispatch costs, sampling, or KV-cache management.
-   At small batches (notably batch=1 decode) these dominate measured
-   wall time and the simulator predicts the analytical floor (~30-60%
-   below measured).
+j. **Decode predictions are still systematically optimistic.** Even with
+   the GEMV efficiency tier, the simulator predicts the analytical floor
+   for decode and does not model kernel-launch overhead, sampling,
+   allocator/dispatch costs, or KV-cache management. At batch=1 these
+   dominate measured wall time (~2× the simulator floor on Llama-2-7B
+   decode). Treat decode predictions as **lower bounds** rather than
+   point estimates; the gap can be closed by adding a per-decode-step
+   constant overhead measured on the target stack, but baking that in
+   should be done from real measurement, not validation auto-tuning.
 
 ## How to extend
 

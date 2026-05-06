@@ -6,9 +6,9 @@ from verl.trainer.ppo.simu.workload_context import WorkloadContext
 
 
 class Operator(ABC):
-    # Static fallback used when an operator's "smallness" doesn't depend on ctx
-    # (no GEMM dims that vary with the workload). For ctx-aware cases (Gemm with
-    # M = batch * prompt_len), override is_small_dim instead.
+    # Static fallback used when an operator's "smallness" doesn't depend on ctx.
+    # For ctx-aware cases (Gemm with M = microbatch * prompt_len), override
+    # is_small_dim instead.
     small_dim: bool = False
 
     @abstractmethod
@@ -26,14 +26,24 @@ class Operator(ABC):
     def is_small_dim(self, ctx: WorkloadContext) -> bool:
         return self.small_dim
 
+    # ----- efficiency selection (overridable per operator type) -----------------
+    # Default: just `hw.compute_efficiency` / `hw.memory_efficiency`. Operator
+    # types whose efficiency depends on shape (notably Gemm with its
+    # GEMV / small / normal tiers) override these to consult the workload.
+
+    def compute_efficiency_factor(self, ctx: WorkloadContext, hw: HardwareSpec) -> float:
+        return hw.compute_efficiency
+
+    def memory_efficiency_factor(self, ctx: WorkloadContext, hw: HardwareSpec) -> float:
+        return hw.memory_efficiency
+
     def compute_time(self, ctx: WorkloadContext, hw: HardwareSpec) -> float:
-        efficiency_factor = (
-            hw.small_gemm_efficiency if self.is_small_dim(ctx) else hw.compute_efficiency
-        )
-        return self.compute_flops(ctx) / (hw.peak_compute_flops * efficiency_factor)
+        eff = self.compute_efficiency_factor(ctx, hw)
+        return self.compute_flops(ctx) / (hw.peak_compute_flops * eff)
 
     def memory_time(self, ctx: WorkloadContext, hw: HardwareSpec) -> float:
-        return self.memory_bytes(ctx) / (hw.peak_memory_bandwidth * hw.memory_efficiency)
+        eff = self.memory_efficiency_factor(ctx, hw)
+        return self.memory_bytes(ctx) / (hw.peak_memory_bandwidth * eff)
 
     def kernel_time(self, ctx: WorkloadContext, hw: HardwareSpec) -> float:
         return max(self.compute_time(ctx, hw), self.memory_time(ctx, hw))

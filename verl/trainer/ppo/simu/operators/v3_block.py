@@ -68,9 +68,10 @@ def _ep_combine() -> NetworkRequirement:
 
 
 def _derive_t_for(phase: TokenCount) -> Callable[[WorkloadContext], float]:
+    # Per-invocation token count; size off microbatch_size (not batch_size).
     if phase is TokenCount.PREFILL:
-        return lambda ctx: float(ctx.batch_size * ctx.prompt_len)
-    return lambda ctx: float(ctx.batch_size)
+        return lambda ctx: float(ctx.microbatch_size * ctx.prompt_len)
+    return lambda ctx: float(ctx.microbatch_size)
 
 
 def _dense_ffn(cfg: V3Config, phase: TokenCount) -> list[Operator]:

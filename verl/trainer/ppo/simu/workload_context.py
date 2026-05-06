@@ -13,9 +13,12 @@ class Workload(Enum):
 class TokenCount(Enum):
     """Resolves to the number of tokens an operator processes in a single invocation.
 
-    PREFILL: every prompt token in flight (B * prompt_len). Also fits PREPARATION
-        and TRAINING forward passes that walk the full sequence in one shot.
-    DECODE:  one new token per request (B), the per-step cost during generation.
+    PREFILL: every prompt token in one microbatch (`microbatch_size × prompt_len`).
+        Used for PREPARATION and TRAINING forward (each invocation walks one
+        microbatch's sequences in one shot). The pipeline scheduler loops this
+        invocation `num_microbatches` times.
+    DECODE: one new token per concurrent request (`microbatch_size`), the
+        per-step cost during generation.
     """
 
     PREFILL = "prefill"
@@ -23,24 +26,28 @@ class TokenCount(Enum):
 
     def resolve(self, ctx: "WorkloadContext") -> int:
         if self is TokenCount.PREFILL:
-            return ctx.batch_size * ctx.prompt_len
+            return ctx.microbatch_size * ctx.prompt_len
         if self is TokenCount.DECODE:
-            return ctx.batch_size
+            return ctx.microbatch_size
         raise ValueError(f"Unknown TokenCount: {self}")
 
 
 @dataclass(frozen=True)
 class WorkloadContext:
-    """Per-invocation workload shape consumed by the operator graph.
+    """Workload shape: per-invocation operator sizing × pipeline loop count.
 
-    `batch_size × prompt_len` is the token count operators see in **one
-    invocation** of the graph (i.e. one microbatch when pipelined). For
-    PP-pipelined training, `batch_size == microbatch_size` and
-    `num_microbatches` is the number of microbatches the simulator's
-    pipeline formula loops the same graph over (per DP rank).
+    - **`microbatch_size`** is the per-invocation batch dimension that
+      operators size off (`microbatch_size × prompt_len` tokens per call).
+    - **`num_microbatches`** is the pipeline-loop multiplier — how many
+      times the same graph is invoked per training step on each DP rank.
+    - **`batch_size`** is the global iteration batch on this DP rank,
+      tied to the others by the invariant
+      `batch_size = microbatch_size × num_microbatches`.
 
-    For non-pipelined workloads (PREPARATION, single-step decode), set
-    `batch_size = microbatch_size` and `num_microbatches = 1`.
+    No operator's `compute_flops` / `memory_bytes` should ever read
+    `batch_size`. Operators size off `microbatch_size` (via
+    `TokenCount.resolve` or a `derive_M` callable). The simulator's
+    pipeline formula reads `num_microbatches`.
     """
 
     workload_type: Workload
@@ -48,17 +55,19 @@ class WorkloadContext:
     microbatch_size: int
     prompt_len: int          # input sequence length per request
     response_len: int        # number of tokens to generate (0 for non-generation)
-    num_microbatches: int    # pipeline multiplier; >= 1
+    num_microbatches: int    # pipeline-loop multiplier; >= 1
 
     def __post_init__(self):
         if self.batch_size <= 0:
             raise ValueError(f"batch_size must be positive, got {self.batch_size}")
         if self.microbatch_size <= 0:
             raise ValueError(f"microbatch_size must be positive, got {self.microbatch_size}")
-        if self.microbatch_size > self.batch_size:
-            raise ValueError(
-                f"microbatch_size ({self.microbatch_size}) cannot exceed "
-                f"batch_size ({self.batch_size})"
-            )
         if self.num_microbatches <= 0:
             raise ValueError(f"num_microbatches must be positive, got {self.num_microbatches}")
+        product = self.microbatch_size * self.num_microbatches
+        if product != self.batch_size:
+            raise ValueError(
+                f"num_microbatches × microbatch_size must equal batch_size; "
+                f"got {self.num_microbatches} × {self.microbatch_size} = "
+                f"{product} ≠ {self.batch_size}."
+            )

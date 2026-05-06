@@ -61,8 +61,17 @@ def derive_backward_pattern(
 
     Network requirements on backward ops mirror their forward counterparts —
     a TP-AR after attn_out forward maps to a TP-AR after the corresponding
-    backward. Per-operator timing doesn't depend on layer order, so the
-    output preserves the forward order; layer-level reversal is handled by
+    backward.
+
+    Structural shape is preserved exactly: TaggedRepeats stay TaggedRepeats
+    with the same `count` and the same number of members; top-level entries
+    stay top-level at the same position. This means `expand_pattern_with_layers`
+    assigns the same `LayerTag` (layer_index + anchor) to corresponding
+    forward/backward operators, which is the invariant the layer-aware PP
+    partitioner relies on to co-locate a layer's forward and backward.
+
+    Per-operator timing doesn't depend on layer order, so the output
+    preserves the forward order; layer-level reversal is handled by
     pipeline scheduling.
     """
     out: list[PatternEntry] = []

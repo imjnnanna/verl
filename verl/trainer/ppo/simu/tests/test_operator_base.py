@@ -24,6 +24,13 @@ class ConcreteOp(Operator):
         # Not used by the base-class smoke tests; just a stable definition.
         return self.flops >= self.bytes_
 
+    def compute_efficiency_factor(self, ctx: WorkloadContext, hw: HardwareSpec) -> float:
+        # Test op uses small_gemm_efficiency when small_dim=True so the legacy
+        # Phase 1 small-dim test path keeps exercising the override mechanism.
+        # (The base Operator default is hw.compute_efficiency unconditionally;
+        # GEMV/small-dim tiering lives on Gemm.)
+        return hw.small_gemm_efficiency if self.small_dim else hw.compute_efficiency
+
 
 @pytest.fixture
 def ctx() -> WorkloadContext:

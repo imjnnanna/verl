@@ -8,7 +8,13 @@ from verl.trainer.ppo.simu.workload_context import WorkloadContext
 
 @dataclass(frozen=True)
 class AdamOptimizerOp(Operator):
-    """Adam optimizer step over a per-DP-rank parameter shard.
+    """Adam optimizer step over a parameter shard.
+
+    Sized to a single layer's (or boundary group's) parameter count when used
+    inside the layer-aware pipeline partition: ModelMapping emits one
+    AdamOptimizerOp per `LayerTag` so each PP stage runs the optimizer for
+    the parameters it owns. The single-AdamOptimizerOp-for-the-whole-step
+    variant is no longer used.
 
     compute_flops:  8 * num_parameters  (m,v update, bias correction, param step)
     memory_bytes:   read params + grads + 2 state moments,

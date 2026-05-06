@@ -176,12 +176,14 @@ SCENARIOS: list[Scenario] = [
         parallelism=ParallelismConfig(tp=2, pp=2, dp=2, ep=1),
         hardware=A100_80GB,
         workload=Workload.TRAINING,
-        # Operators size off batch_size×prompt_len (per-microbatch token count).
-        # num_microbatches is per-DP-rank since the pipeline formula loops it
-        # within one DP rank: global_batch / dp / microbatch_size = 64/2/4 = 8.
+        # Per-DP-rank: global_batch / dp = 64/2 = 32. microbatch_size=4
+        # implies num_microbatches=8 (the pipeline-loop multiplier).
+        # The WorkloadContext invariant batch_size = microbatch_size × num_microbatches
+        # is enforced. Operators size their per-invocation work off
+        # microbatch_size × prompt_len.
         workload_ctx=WorkloadContext(
             workload_type=Workload.TRAINING,
-            batch_size=4, microbatch_size=4,
+            batch_size=32, microbatch_size=4,
             prompt_len=2048, response_len=0, num_microbatches=8,
         ),
         reference_latency_ms=4000.0,  # midpoint of 3-5s

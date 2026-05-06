@@ -31,8 +31,9 @@ class PrefillAttention(Operator):
 
     @staticmethod
     def _t2(ctx: WorkloadContext) -> int:
-        # Uniform prompt length assumption: sum_r l_r^2 = B * L^2.
-        return ctx.batch_size * ctx.prompt_len * ctx.prompt_len
+        # Per-invocation work: uniform prompt length assumption ⇒
+        # sum_r l_r^2 = microbatch_size * prompt_len^2.
+        return ctx.microbatch_size * ctx.prompt_len * ctx.prompt_len
 
     def compute_flops(self, ctx: WorkloadContext) -> float:
         return 2.0 * self.num_heads * self.head_size * self._t2(ctx)
@@ -53,9 +54,15 @@ class DecodeAttention(Operator):
     """GQA decode attention. Each step processes 1 new query token per request,
     attending over the running KV cache.
 
-    Per request:
-      compute: 2 * num_heads * head_size * avg_context_length  (sum over query heads)
-      memory:  batch * avg_context_length * kv_bytes_per_token  (K + V reads dominate)
+    Per invocation:
+      compute: 2 * num_heads * head_size * avg_context_length * microbatch_size
+      memory:  microbatch_size * avg_context_length * kv_bytes_per_token
+
+    `microbatch_size` here is the number of concurrent decode requests in
+    this invocation — for non-pipelined decode (the common case) it equals
+    the generation batch. The naming is shared with training-microbatch
+    elsewhere because both denote "per-invocation batch dimension"; only the
+    workload semantics differ.
 
     avg_context_length = prompt_len + response_len/2, the mean attended length
     over a uniform decode trajectory.
@@ -89,12 +96,12 @@ class DecodeAttention(Operator):
     def compute_flops(self, ctx: WorkloadContext) -> float:
         return (
             2.0 * self.num_heads * self.head_size
-            * self.avg_context_length(ctx) * ctx.batch_size
+            * self.avg_context_length(ctx) * ctx.microbatch_size
         )
 
     def memory_bytes(self, ctx: WorkloadContext) -> float:
         return (
-            ctx.batch_size * self.avg_context_length(ctx) * self.kv_bytes_per_token
+            ctx.microbatch_size * self.avg_context_length(ctx) * self.kv_bytes_per_token
         )
 
     def is_compute_bound(self, ctx: WorkloadContext, hw: HardwareSpec) -> bool:

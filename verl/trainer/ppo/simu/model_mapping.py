@@ -1,4 +1,5 @@
 from __future__ import annotations
+from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -23,10 +24,11 @@ from verl.trainer.ppo.simu.network_requirement import (
 from verl.trainer.ppo.simu.operator import Operator
 from verl.trainer.ppo.simu.operators.backward import derive_backward_pattern
 from verl.trainer.ppo.simu.operators.builders import (
+    LayerTag,
     OperatorWithReqs,
     PatternEntry,
-    expand_tagged_pattern,
-    split_pattern,
+    expand_pattern_with_layers,
+    split_pattern_with_layers,
 )
 from verl.trainer.ppo.simu.operators.optimizer import AdamOptimizerOp
 from verl.trainer.ppo.simu.relation import NetworkAssociation, NetworkPhase
@@ -44,24 +46,64 @@ class SimulationResult:
     per_op_breakdown: list[float] = field(default_factory=list)
 
 
-def _even_partition(num_ops: int, num_stages: int) -> list[list[int]]:
-    """Even split of operator indices into `num_stages` contiguous groups.
+# Reference HardwareSpec used solely by the layer-aware PP partitioner to
+# compute layer cost ratios. The partition is invariant under uniform
+# rescaling of compute/memory, so the absolute numbers don't matter — only
+# the ratio compute_flops/memory_bytes does. Using A100-class avoids
+# pathological GEMV vs. compute-bound inversions.
+_PARTITION_REF_HW = HardwareSpec(
+    peak_compute_flops=312e12,
+    peak_memory_bandwidth=2.0e12,
+    ridge_flops_per_byte=156.0,
+)
 
-    TODO(phase5): replace with cost-balanced partitioning by per-op kernel_time
-    at a reference workload.
+
+def _partition_layers_by_cost(layer_costs: list[float], num_stages: int) -> list[list[int]]:
+    """Contiguous-split layer indices into `num_stages` groups, minimizing the
+    maximum group cost (linear-time partition / "painter's partition" DP).
+
+    Returns list of length `num_stages`; each entry is a list of layer
+    positions (0-indexed) belonging to that stage. Stages may be empty if
+    `num_stages > len(layer_costs)`.
+
+    Complexity: O(num_stages × n²) where n = len(layer_costs). Trivial for
+    realistic models (n ≤ ~80 layers, num_stages ≤ ~16).
     """
     if num_stages <= 0:
         raise ValueError("num_stages must be positive")
-    if num_ops == 0:
+    n = len(layer_costs)
+    if n == 0:
         return [[] for _ in range(num_stages)]
-    chunk, rem = divmod(num_ops, num_stages)
-    out: list[list[int]] = []
-    start = 0
-    for i in range(num_stages):
-        size = chunk + (1 if i < rem else 0)
-        out.append(list(range(start, start + size)))
-        start += size
-    return out
+    if num_stages >= n:
+        return [[i] if i < n else [] for i in range(num_stages)]
+
+    # Prefix sums for O(1) range cost queries.
+    prefix = [0.0] * (n + 1)
+    for i in range(n):
+        prefix[i + 1] = prefix[i] + layer_costs[i]
+
+    inf = float("inf")
+    # dp[s][i] = best (min) max-stage-cost partitioning layers[0..i) into s stages.
+    dp = [[inf] * (n + 1) for _ in range(num_stages + 1)]
+    cut = [[0] * (n + 1) for _ in range(num_stages + 1)]
+    dp[0][0] = 0.0
+    for s in range(1, num_stages + 1):
+        for i in range(1, n + 1):
+            # Last stage covers layers[j..i); j must leave at least s-1 layers for previous stages.
+            for j in range(s - 1, i):
+                stage_cost = prefix[i] - prefix[j]
+                cost = max(dp[s - 1][j], stage_cost)
+                if cost < dp[s][i]:
+                    dp[s][i] = cost
+                    cut[s][i] = j
+
+    partition: list[list[int]] = [[] for _ in range(num_stages)]
+    i = n
+    for s in range(num_stages, 0, -1):
+        j = cut[s][i]
+        partition[s - 1] = list(range(j, i))
+        i = j
+    return partition
 
 
 @dataclass
@@ -90,11 +132,13 @@ class ModelMapping:
     # Computed in __post_init__:
     operator_pattern: list[Operator] = field(init=False, default_factory=list)
     per_op_network_requirements: list[list[NetworkRequirement]] = field(init=False, default_factory=list)
+    per_op_layer_tags: list[LayerTag] = field(init=False, default_factory=list)
     network_ops: dict[NetworkRequirement, NetworkOp] = field(init=False, default_factory=dict)
     pipeline_partition: list[list[int]] = field(init=False, default_factory=list)
     # GENERATION holds a parallel decode-shaped graph; everything else is empty.
     decode_operator_pattern: list[Operator] = field(init=False, default_factory=list)
     decode_per_op_network_requirements: list[list[NetworkRequirement]] = field(init=False, default_factory=list)
+    decode_per_op_layer_tags: list[LayerTag] = field(init=False, default_factory=list)
     decode_pipeline_partition: list[list[int]] = field(init=False, default_factory=list)
 
     def __post_init__(self) -> None:
@@ -104,19 +148,7 @@ class ModelMapping:
         elif self.workload is Workload.PREPARATION:
             self._install_pattern(self._build_pattern("prefill"), is_decode=False)
         elif self.workload is Workload.TRAINING:
-            forward = self._build_pattern("training")
-            backward = derive_backward_pattern(forward, recompute=True)
-            forward_ops, _ = split_pattern(expand_tagged_pattern(forward))
-            # Per-DP-rank parameter count = total local (already-tp/pp-sharded) params.
-            # No ZeRO assumed; each DP rank holds and updates its own copy.
-            dtype_bytes_param = 2
-            total_param_bytes = sum(op.parameter_bytes() for op in forward_ops)
-            num_params = total_param_bytes // dtype_bytes_param if dtype_bytes_param else 0
-            opt_entry: OperatorWithReqs = (
-                AdamOptimizerOp(num_parameters=num_params, dtype_bytes_param=dtype_bytes_param),
-                [],
-            )
-            self._install_pattern(forward + backward + [opt_entry], is_decode=False)
+            self._install_training_pattern()
         elif self.workload is Workload.DORMANT:
             pass  # leaves operator_pattern empty
         else:
@@ -135,17 +167,136 @@ class ModelMapping:
         return self.model.build_pattern(self.model.architecture, phase, self.parallelism)
 
     def _install_pattern(self, pattern: list[PatternEntry], is_decode: bool) -> None:
-        expanded = expand_tagged_pattern(pattern)
-        ops, reqs = split_pattern(expanded)
-        partition = _even_partition(len(ops), max(self.parallelism.pp, 1))
+        expanded = expand_pattern_with_layers(pattern)
+        ops, reqs, tags = split_pattern_with_layers(expanded)
+        partition = self._layer_aware_partition(ops, tags)
         if is_decode:
             self.decode_operator_pattern = ops
             self.decode_per_op_network_requirements = reqs
+            self.decode_per_op_layer_tags = tags
             self.decode_pipeline_partition = partition
         else:
             self.operator_pattern = ops
             self.per_op_network_requirements = reqs
+            self.per_op_layer_tags = tags
             self.pipeline_partition = partition
+
+    def _install_training_pattern(self) -> None:
+        """Build forward + backward + per-layer optimizer with consistent layer tags.
+
+        Forward and backward share `LayerTag`s by construction (derive_backward_pattern
+        preserves the structural shape). Optimizer ops are emitted one per
+        layer-tag-with-non-zero-params; each carries the same tag so the
+        partitioner co-locates a layer's forward, backward, and optimizer.
+        """
+        forward = self._build_pattern("training")
+        backward = derive_backward_pattern(forward, recompute=True)
+
+        forward_expanded = expand_pattern_with_layers(forward)
+        backward_expanded = expand_pattern_with_layers(backward)
+
+        # Aggregate parameter bytes per LayerTag.
+        params_by_tag: dict[LayerTag, int] = defaultdict(int)
+        for (op, _reqs), tag in forward_expanded:
+            params_by_tag[tag] += op.parameter_bytes()
+
+        # One AdamOptimizerOp per tag with non-zero params.
+        dtype_bytes_param = 2
+        optimizer_expanded: list[tuple[OperatorWithReqs, LayerTag]] = []
+        for tag, total_param_bytes in params_by_tag.items():
+            if total_param_bytes <= 0:
+                continue
+            num_params = total_param_bytes // dtype_bytes_param
+            opt = AdamOptimizerOp(num_parameters=num_params, dtype_bytes_param=dtype_bytes_param)
+            optimizer_expanded.append(((opt, []), tag))
+
+        full = forward_expanded + backward_expanded + optimizer_expanded
+        ops, reqs, tags = split_pattern_with_layers(full)
+        partition = self._layer_aware_partition(ops, tags)
+        self.operator_pattern = ops
+        self.per_op_network_requirements = reqs
+        self.per_op_layer_tags = tags
+        self.pipeline_partition = partition
+
+    # ----- layer-aware pipeline partition --------------------------------------------
+
+    def _reference_partition_ctx(self) -> WorkloadContext:
+        """Synthetic reference workload used only for measuring relative layer cost.
+
+        Operators are sized off `microbatch_size × prompt_len` per invocation,
+        so a microbatch_size of 1 keeps the partition stable across the
+        eventual real workload. Only the *ratio* between layer costs matters
+        for the partition.
+        """
+        return WorkloadContext(
+            workload_type=self.workload,
+            batch_size=1,
+            microbatch_size=1,
+            prompt_len=2048,
+            response_len=128 if self.workload is Workload.GENERATION else 0,
+            num_microbatches=1,
+        )
+
+    def _layer_aware_partition(
+        self,
+        ops: list[Operator],
+        tags: list[LayerTag],
+    ) -> list[list[int]]:
+        """Layer-co-locating PP partition.
+
+        Operators sharing a `layer_index` always land on the same stage
+        (real PP keeps a layer's forward and backward on the same hardware).
+        Layers are split into `pp` contiguous groups by min-max cost using
+        per-layer kernel time at a synthetic reference workload. Boundary
+        ops (`anchor="first"` / `"last"`) pin to the first / last stage.
+        """
+        pp = max(self.parallelism.pp, 1)
+        n = len(ops)
+        if pp == 1 or n == 0:
+            return [list(range(n))] + [[] for _ in range(pp - 1)]
+
+        # Group op indices by layer tag.
+        indices_by_layer: dict[int, list[int]] = defaultdict(list)
+        first_anchor: list[int] = []
+        last_anchor: list[int] = []
+        for i, tag in enumerate(tags):
+            if tag.layer_index is not None:
+                indices_by_layer[tag.layer_index].append(i)
+            elif tag.anchor == "last":
+                last_anchor.append(i)
+            else:
+                # "first" or fallback default.
+                first_anchor.append(i)
+
+        layer_indices_sorted = sorted(indices_by_layer.keys())
+        if not layer_indices_sorted:
+            # No numeric layers — put boundary ops on first stage.
+            stage0 = sorted(first_anchor + last_anchor)
+            return [stage0] + [[] for _ in range(pp - 1)]
+
+        # Per-layer cost = sum of kernel_time of all ops sharing this layer index,
+        # at the reference ctx + reference hw.
+        ref_ctx = self._reference_partition_ctx()
+        layer_costs: list[float] = []
+        for lidx in layer_indices_sorted:
+            cost = sum(
+                ops[i].kernel_time(ref_ctx, _PARTITION_REF_HW)
+                for i in indices_by_layer[lidx]
+            )
+            layer_costs.append(cost)
+
+        layer_partition = _partition_layers_by_cost(layer_costs, pp)
+
+        out: list[list[int]] = [[] for _ in range(pp)]
+        for stage_idx, layer_positions in enumerate(layer_partition):
+            for layer_pos in layer_positions:
+                lidx = layer_indices_sorted[layer_pos]
+                out[stage_idx].extend(sorted(indices_by_layer[lidx]))
+
+        # Pin boundary ops (embed → first stage, final norm + LM head → last stage).
+        out[0] = sorted(first_anchor) + out[0]
+        out[-1] = out[-1] + sorted(last_anchor)
+        return out
 
     # ----- network requirement resolution --------------------------------------------
 
@@ -289,6 +440,9 @@ class ModelMapping:
                 wall = assoc.combine_times(wall, net_time)
             per_op.append(wall)
 
+        # Stage time = sum of per-op walls for ops in that stage. Partition is
+        # an explicit list of indices (layer-aware), so explicit indexing
+        # (not slicing) is required.
         stage_times = [sum(per_op[i] for i in stage) for stage in partition]
 
         if not pipelined or self.parallelism.pp <= 1:

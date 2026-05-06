@@ -245,14 +245,14 @@ def _findings_hypothesis(r: ScenarioResult) -> str:
         # Predicted too low.
         if "decode" in name:
             return (
-                "Pure roofline does not include kernel-launch overhead, KV-cache management, "
-                "or sampling latency — these dominate at batch=1 decode (real wall time is "
-                "typically 2-3× the analytical floor). Total memory traffic per decode step "
-                "≈ model_size + KV reads ≈ 13.4 GB on Llama-2-7B; at peak·η_mem ≈ 1.6 TB/s "
-                "the floor is ~8 ms, matching the prediction. memory_efficiency=0.8 is also "
-                "optimistic for tiny M=1 GEMMs — small_gemm_efficiency=0.4 currently triggers "
-                "only when min(M,N,K) < 1024, which excludes K=4096 GEMMs even with M=1. "
-                "Not a formula bug; the simulator's scope stops at the roofline."
+                "Pure roofline + GEMV efficiency tier (0.3 compute / 0.65 memory for M<16 "
+                "GEMMs) is now the prediction. Total memory traffic per decode step ≈ model "
+                "weights once + KV cache reads. The remaining gap to measured wall time is "
+                "kernel-launch overhead, sampling, and KV-cache management — the simulator's "
+                "scope stops at the roofline. To close further: (a) profile actual GEMV "
+                "memory_efficiency on the target A100 — typical measurements are 0.5-0.6 "
+                "rather than the 0.65 default; (b) bake in a per-decode-step constant overhead "
+                "after profiling a real run. Do NOT auto-tune from validation alone."
             )
         if "prefill" in name:
             return (
@@ -267,14 +267,17 @@ def _findings_hypothesis(r: ScenarioResult) -> str:
         # Predicted too high.
         if "training" in name:
             return (
-                "Above reference. Dominant cause: even-by-op-count PP partition splits a "
-                "forward-then-backward pattern so stage 0 = all forward ops and stage 1 = all "
-                "backward (3× heavier with recompute) + optimizer. max_stage is then the "
-                "backward stage, and the (num_microbatches + pp - 1) pipeline multiplier "
-                "amplifies the imbalance. Cost-balanced partition (the deferred TODO from the "
-                "ModelMapping.__post_init__ comment) — interleaving forward and backward across "
-                "stages — should roughly halve max_stage. Backward 3× with recompute is also "
-                "conservative; FlashAttention backward + selective checkpointing reach ~2-2.5×."
+                "Above reference. Layer-aware PP partitioning is now in place "
+                "(the previous flat-partition bug is fixed); remaining gap likely comes from: "
+                "(a) BackwardOp's 3× compute / 3× memory scaling with full activation "
+                "recomputation is conservative — FlashAttention backward + selective "
+                "checkpointing typically achieve 2.0-2.5× rather than 3×; "
+                "(b) compute_efficiency=0.7 may be high for backward kernels where "
+                "memory-traffic patterns differ from forward; (c) the optimizer step time "
+                "(per-layer AdamOptimizerOps) gets multiplied through the (num_microbatches + "
+                "pp - 1) pipeline formula even though optimizer is one-shot per iteration — "
+                "minor effect since optimizer time is small relative to backward, but a "
+                "principled fix would isolate optimizer from the 1F1B multiplier."
             )
         if "deepseek_v3" in name:
             return (

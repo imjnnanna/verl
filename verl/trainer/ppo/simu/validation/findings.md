@@ -1,4 +1,4 @@
-# Simulator validation findings — 2026-05-06T21:46:22Z
+# Simulator validation findings — 2026-05-06T22:11:30Z
 
 Generated automatically by `run_validation.py` whenever any scenario is more than 30% off its published reference. Default tolerance is 50%; training and DeepSeek-V3 are tagged as sanity bounds (100%).
 
@@ -7,9 +7,9 @@ Generated automatically by `run_validation.py` whenever any scenario is more tha
 | scenario | predicted | reference | error % | tolerance % | pass |
 |---|---:|---:|---:|---:|:---:|
 | llama2_7b_prefill_a100 | 57.6 ms | 50.0 ms | +15.2% | 50% | ✓ |
-| llama2_7b_decode_a100 | 8.4 ms | 25.0 ms | -66.3% | 50% | ✗ |
+| llama2_7b_decode_a100 | 10.3 ms | 25.0 ms | -58.6% | 50% | ✗ |
 | llama3_70b_prefill_8xa100_tp8 | 209.7 ms | 250.0 ms | -16.1% | 50% | ✓ |
-| llama3_8b_training_8xa100_tp2_pp2_dp2 | 10660.9 ms | 4000.0 ms | +166.5% | 100% | ✗ |
+| llama3_8b_training_8xa100_tp2_pp2_dp2 | 7748.7 ms | 4000.0 ms | +93.7% | 100% | ✓ |
 | deepseek_v3_prefill_32xh100_ep32 | 1095.9 ms | 500.0 ms | +119.2% | 100% | ✗ |
 
 ## Per-scenario investigation
@@ -18,26 +18,26 @@ Generated automatically by `run_validation.py` whenever any scenario is more tha
 
 _Llama-2-7B decode, batch=1, single A100-80GB. Reference ~25ms/token (vLLM)._
 
-- **Predicted:** 8.4 ms  **Reference:** 25.0 ms  **Error:** -66.3%  **Tolerance:** ±50% (exceeds tolerance)
+- **Predicted:** 10.3 ms  **Reference:** 25.0 ms  **Error:** -58.6%  **Tolerance:** ±50% (exceeds tolerance)
 
 **Dominant operators by wall-time fraction:**
 
-- `Gemm` — 94.6%
+- `Gemm` — 94.8%
 - `PrefillAttention` — 3.0%
 - `SwiGLUActivation` — 1.0%
 - `RMSNorm` — 0.5%
 - `RoPE` — 0.5%
-- `DecodeAttention` — 0.3%
+- `DecodeAttention` — 0.2%
 
 **Hypothesis:**
 
-Pure roofline does not include kernel-launch overhead, KV-cache management, or sampling latency — these dominate at batch=1 decode (real wall time is typically 2-3× the analytical floor). Total memory traffic per decode step ≈ model_size + KV reads ≈ 13.4 GB on Llama-2-7B; at peak·η_mem ≈ 1.6 TB/s the floor is ~8 ms, matching the prediction. memory_efficiency=0.8 is also optimistic for tiny M=1 GEMMs — small_gemm_efficiency=0.4 currently triggers only when min(M,N,K) < 1024, which excludes K=4096 GEMMs even with M=1. Not a formula bug; the simulator's scope stops at the roofline.
+Pure roofline + GEMV efficiency tier (0.3 compute / 0.65 memory for M<16 GEMMs) is now the prediction. Total memory traffic per decode step ≈ model weights once + KV cache reads. The remaining gap to measured wall time is kernel-launch overhead, sampling, and KV-cache management — the simulator's scope stops at the roofline. To close further: (a) profile actual GEMV memory_efficiency on the target A100 — typical measurements are 0.5-0.6 rather than the 0.65 default; (b) bake in a per-decode-step constant overhead after profiling a real run. Do NOT auto-tune from validation alone.
 
 ### llama3_8b_training_8xa100_tp2_pp2_dp2
 
 _Llama-3-8B training step, batch=64, microbatch=4, prompt=2048, 8xA100-80GB TP=2 PP=2 DP=2. Reference ~3-5s (Megatron-class). Sanity bound._
 
-- **Predicted:** 10660.9 ms  **Reference:** 4000.0 ms  **Error:** +166.5%  **Tolerance:** ±100% (exceeds tolerance)
+- **Predicted:** 7748.7 ms  **Reference:** 4000.0 ms  **Error:** +93.7%  **Tolerance:** ±100% (within tolerance)
 
 **Dominant operators by wall-time fraction:**
 
@@ -50,7 +50,7 @@ _Llama-3-8B training step, batch=64, microbatch=4, prompt=2048, 8xA100-80GB TP=2
 
 **Hypothesis:**
 
-Above reference. Dominant cause: even-by-op-count PP partition splits a forward-then-backward pattern so stage 0 = all forward ops and stage 1 = all backward (3× heavier with recompute) + optimizer. max_stage is then the backward stage, and the (num_microbatches + pp - 1) pipeline multiplier amplifies the imbalance. Cost-balanced partition (the deferred TODO from the ModelMapping.__post_init__ comment) — interleaving forward and backward across stages — should roughly halve max_stage. Backward 3× with recompute is also conservative; FlashAttention backward + selective checkpointing reach ~2-2.5×.
+Above reference. Layer-aware PP partitioning is now in place (the previous flat-partition bug is fixed); remaining gap likely comes from: (a) BackwardOp's 3× compute / 3× memory scaling with full activation recomputation is conservative — FlashAttention backward + selective checkpointing typically achieve 2.0-2.5× rather than 3×; (b) compute_efficiency=0.7 may be high for backward kernels where memory-traffic patterns differ from forward; (c) the optimizer step time (per-layer AdamOptimizerOps) gets multiplied through the (num_microbatches + pp - 1) pipeline formula even though optimizer is one-shot per iteration — minor effect since optimizer time is small relative to backward, but a principled fix would isolate optimizer from the 1F1B multiplier.
 
 ### deepseek_v3_prefill_32xh100_ep32
 
