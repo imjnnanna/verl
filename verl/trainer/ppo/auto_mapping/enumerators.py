@@ -73,9 +73,14 @@ def enum_placement_groups(L: List[Role], N_gpus: int, colocate_same_models=True)
 def valid_submeshes(N: int, M: int, min_area: int) -> List[Tuple[int, int]]:
     # print(f"Finding valid submeshes for N={N}, M={M}, min_area={min_area}")
     submeshes = []
+    
+    # if M not power of 2
+    log2M = int(math.log2(M)) if M > 0 else 0
+    if M >= min_area and (1 << log2M) != M:
+        submeshes.append((1, M))
 
     # 1-row submeshes: (1, 1), ..., (1, m)
-    for w in range(int(math.log2(M)), -1, -1):
+    for w in range(log2M, -1, -1):
         if 2**w < min_area:
             break
         submeshes.append((1, 2**w))
