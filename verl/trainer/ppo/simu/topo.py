@@ -136,7 +136,7 @@ class Path:
         self.bandwidth = min(link[i].bandwidth for i in range(len(link)))
         self.latency = sum(link[i].latency for i in range(len(link)))
 
-@dataclass
+@dataclass(frozen=True)
 class Link:
     node_a_id: int # node A ID
     node_b_id: int # node B ID

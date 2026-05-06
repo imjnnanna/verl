@@ -80,6 +80,12 @@ class ModelMapping:
     parallelism: ParallelismConfig
     shards_to_host_ids: dict[Shard, int]
     host_id_to_shard: dict[int, Shard]
+    # Reference data_GB per collective kind for sizing the constructed
+    # NetworkOps. Empty dict (default) treats every collective as 0-byte —
+    # callers that want realistic contention should populate this with
+    # estimated activation sizes per collective. Phase 4b's stage orchestrator
+    # is the natural source.
+    data_GB_estimates: dict["CollectiveKind", float] = field(default_factory=dict)
 
     # Computed in __post_init__:
     operator_pattern: list[Operator] = field(init=False, default_factory=list)
@@ -179,19 +185,20 @@ class ModelMapping:
         """
         shards = self._shards_in_group(req.group)
         kind = req.kind
+        data_GB = self.data_GB_estimates.get(kind, 0.0)
         if kind is CollectiveKind.ALL_REDUCE:
-            return AllReduceRing.generate(self, shards, data_GB=0.0)
+            return AllReduceRing.generate(self, shards, data_GB=data_GB)
         if kind is CollectiveKind.ALL_GATHER:
-            return AllGatherRing.generate(self, shards, data_GB=0.0)
+            return AllGatherRing.generate(self, shards, data_GB=data_GB)
         if kind is CollectiveKind.REDUCE_SCATTER:
-            return ReduceScatterRing.generate(self, shards, data_GB=0.0)
+            return ReduceScatterRing.generate(self, shards, data_GB=data_GB)
         if kind in (CollectiveKind.ALL_TO_ALL_DISPATCH, CollectiveKind.ALL_TO_ALL_COMBINE):
-            return AllToAll.generate(self, shards, data_GB=0.0)
+            return AllToAll.generate(self, shards, data_GB=data_GB)
         if kind in (CollectiveKind.P2P_PIPELINE_FORWARD, CollectiveKind.P2P_PIPELINE_BACKWARD):
             if len(shards) < 2:
                 # Degenerate — single-rank "pipeline". No transfer.
                 return P2P(logical_transfers=[])
-            return P2P.generate(self, shards[0], shards[1], data_GB=0.0)
+            return P2P.generate(self, shards[0], shards[1], data_GB=data_GB)
         raise ValueError(f"Unknown CollectiveKind: {kind!r}")
 
     # ----- simulation ----------------------------------------------------------------

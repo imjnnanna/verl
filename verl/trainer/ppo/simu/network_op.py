@@ -38,16 +38,23 @@ class NetworkOp(ABC):
     @staticmethod
     def time_simultaneous_system_flow(ops: list[NetworkOp], topo: HostTopo) -> list[float]:
         all_transfers = [transfer for op in ops for transfer in op.logical_transfers]
-        topo_input = [((t.src_host_id, t.dst_host_id), t.data_GB) for t in all_transfers]
-        flow_times = topo.get_simultaneous_system_flow_time(topo_input)
-        transfer_times = dict(zip(all_transfers, flow_times))
+        if not all_transfers:
+            return [0.0 for _ in ops]
+        # topo.get_simultaneous_system_flow_time consumes LogicalTransfer
+        # objects and returns dict[(src, dst), time]. Map each transfer to
+        # its pair's time so each op sees a dict[LogicalTransfer, time].
+        pair_times = topo.get_simultaneous_system_flow_time(all_transfers)
+        transfer_times: dict[LogicalTransfer, float] = {
+            t: pair_times.get((t.src_host_id, t.dst_host_id), 0.0) for t in all_transfers
+        }
         return [op.get_operator_time(transfer_times) for op in ops]
 
     @staticmethod
     def time_simultaneous_system_operators(ops: list[NetworkOp], topo: HostTopo) -> list[float]:
         all_transfers = [transfer for op in ops for transfer in op.logical_transfers]
+        if not all_transfers:
+            return [0.0 for _ in ops]
         transfer_times = topo.get_simultaneous_logical_transfer_times(all_transfers)
-
         return [op.get_operator_time(transfer_times) for op in ops]
 
     @abstractmethod
@@ -211,6 +218,12 @@ class LogicalTransfer:
     src_host_id: int
     dst_host_id: int
     data_GB: float
+
+    # Alias matching the field name `topo.HostTopo.get_simultaneous_system_flow_time`
+    # uses internally. Same value as `data_GB`.
+    @property
+    def data_size_GB(self) -> float:
+        return self.data_GB
 
     def get_connection_tuple(self) -> tuple[int, int]:
         return (self.src_host_id, self.dst_host_id)
