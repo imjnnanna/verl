@@ -1,12 +1,16 @@
 from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import ClassVar, Optional
+from typing import TYPE_CHECKING, ClassVar, Optional
 
-from verl.trainer.ppo.simu.model_mapping import ModelMapping
 from verl.trainer.ppo.simu.relation import NetworkPhase
 from verl.trainer.ppo.simu.shard import Shard
 from verl.trainer.ppo.simu.topo import HostTopo
+
+if TYPE_CHECKING:
+    # ModelMapping imports NetworkOp at runtime; defer this back-reference to
+    # break the cycle.
+    from verl.trainer.ppo.simu.model_mapping import ModelMapping
 
 @dataclass(frozen=True)
 class NetworkOp(ABC):

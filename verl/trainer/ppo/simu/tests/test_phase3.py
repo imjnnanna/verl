@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from verl.trainer.ppo.simu.operators.attention import DecodeAttention
-from verl.trainer.ppo.simu.operators.composite import expand_layers
+from verl.trainer.ppo.simu.operators.builders import expand_tagged_pattern, split_pattern
 from verl.trainer.ppo.simu.operators.mla import build_mla_decode
 from verl.trainer.ppo.simu.operators.v3_block import (
     build_v3_dense_layer,
@@ -23,9 +23,14 @@ def _prefill_ctx(batch: int, prompt_len: int) -> WorkloadContext:
     )
 
 
+def _expanded_ops(cfg: V3Config, phase: TokenCount):
+    expanded = expand_tagged_pattern(build_v3_model(cfg, phase))
+    return split_pattern(expanded)
+
+
 def test_v3_prefill_operator_count():
     cfg = V3Config()
-    ops = expand_layers(build_v3_model(cfg, TokenCount.PREFILL))
+    ops, _ = _expanded_ops(cfg, TokenCount.PREFILL)
 
     dense_ops = build_v3_dense_layer(cfg, TokenCount.PREFILL)
     moe_ops = build_v3_moe_layer(cfg, TokenCount.PREFILL)
@@ -40,9 +45,8 @@ def test_v3_prefill_operator_count():
 
 
 def test_v3_total_parameter_bytes():
-    """Total parameter bytes should land near 671B params * 2 bytes ~= 1.34 TB."""
     cfg = V3Config()
-    ops = expand_layers(build_v3_model(cfg, TokenCount.PREFILL))
+    ops, _ = _expanded_ops(cfg, TokenCount.PREFILL)
 
     total_bytes = sum(op.parameter_bytes() for op in ops)
 
@@ -72,9 +76,8 @@ def test_mla_decode_kv_cache_per_token():
 
 
 def test_v3_activated_parameters_per_token():
-    """Per-token activated params (shared + top_k routed + always-on) ~= 37B for V3."""
     cfg = V3Config()
-    ops = expand_layers(build_v3_model(cfg, TokenCount.PREFILL))
+    ops, _ = _expanded_ops(cfg, TokenCount.PREFILL)
 
     activated_bytes = sum(op.activated_parameter_bytes() for op in ops)
 
@@ -89,10 +92,9 @@ def test_v3_activated_parameters_per_token():
 
 
 def test_v3_prefill_graph_builds():
-    """Smoke test: every op evaluates compute_flops/memory_bytes without raising."""
     cfg = V3Config()
     ctx = _prefill_ctx(batch=1, prompt_len=4096)
-    ops = expand_layers(build_v3_model(cfg, TokenCount.PREFILL))
+    ops, _ = _expanded_ops(cfg, TokenCount.PREFILL)
     for op in ops:
         assert op.compute_flops(ctx) >= 0.0
         assert op.memory_bytes(ctx) >= 0.0

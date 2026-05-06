@@ -1,9 +1,11 @@
 from __future__ import annotations
 from dataclasses import dataclass
 
+from verl.trainer.ppo.simu.model import ArchitectureConfig
+
 
 @dataclass(frozen=True)
-class V3Config:
+class V3Config(ArchitectureConfig):
     """DeepSeek-V3 architectural parameters."""
 
     h: int = 7168
