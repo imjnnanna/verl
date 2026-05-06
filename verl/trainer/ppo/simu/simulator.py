@@ -2,6 +2,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from verl.trainer.ppo.simu.hardware import HardwareSpec
+from verl.trainer.ppo.simu.model_mapping import SimulationResult
 from verl.trainer.ppo.simu.stages import RLHFTimeline
 from verl.trainer.ppo.simu.submesh_mapping import (
     SubmeshMapping,
@@ -18,6 +19,10 @@ class IterationResult:
     total_time: float
     per_stage_times: list[float] = field(default_factory=list)
     per_boundary_times: list[float] = field(default_factory=list)
+    # Flattened across stages and submeshes in stage-then-submesh-then-mm order.
+    # Useful for validation / introspection — pull per-MM prefill/decode/training
+    # times without re-running the simulation.
+    per_mm_results: list[SimulationResult] = field(default_factory=list)
 
 
 def simulate_stage(
@@ -62,9 +67,27 @@ def simulate_rlhf_iteration(
     total = 0.0
     per_stage_times: list[float] = []
     per_boundary_times: list[float] = []
+    per_mm_results: list[SimulationResult] = []
 
     for i, stage in enumerate(timeline.stages):
-        stage_time = simulate_stage(stage, workload_ctx, hw, topo)
+        if not stage:
+            stage_time = 0.0
+        else:
+            # Same shape as simulate_stage but accumulates per-MM results.
+            all_mappings = [mm for sm in stage for mm in sm.model_mappings]
+            steady_ops, boundary_ops = partition_steady_boundary(all_mappings)
+            steady_times = steady_transfer_times(steady_ops, topo)
+            boundary_times = boundary_transfer_times(boundary_ops, topo)
+
+            submesh_times: list[float] = []
+            for sm in stage:
+                sm_time = 0.0
+                for mm in sm.model_mappings:
+                    sim = mm.simulate(workload_ctx, hw, steady_times, boundary_times)
+                    per_mm_results.append(sim)
+                    sm_time += sim.total_time
+                submesh_times.append(sm_time)
+            stage_time = max(submesh_times)
         total += stage_time
         per_stage_times.append(stage_time)
         if i < len(timeline.boundaries):
@@ -79,4 +102,5 @@ def simulate_rlhf_iteration(
         total_time=total,
         per_stage_times=per_stage_times,
         per_boundary_times=per_boundary_times,
+        per_mm_results=per_mm_results,
     )

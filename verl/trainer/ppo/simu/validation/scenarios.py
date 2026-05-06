@@ -1,0 +1,210 @@
+"""Reference scenarios for validation against published latency numbers.
+
+Each scenario specifies:
+  - the model architecture and its build_pattern
+  - parallelism (tp/pp/dp/ep)
+  - hardware spec
+  - workload + workload context
+  - reference latency in ms
+  - tolerance (% of reference)
+  - which metric in SimulationResult to compare ("total" / "decode_step")
+
+Tolerances default to 50% but a few scenarios use 100% where the brief
+explicitly calls out a "sanity bound" rather than a tight target.
+"""
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Callable
+
+from verl.trainer.ppo.simu.hardware import HardwareSpec
+from verl.trainer.ppo.simu.model import ArchitectureConfig
+from verl.trainer.ppo.simu.network_requirement import ParallelismConfig
+from verl.trainer.ppo.simu.operators.builders import PatternEntry
+from verl.trainer.ppo.simu.operators.llama_builder import build_llama_pattern
+from verl.trainer.ppo.simu.operators.llama_config import LlamaConfig
+from verl.trainer.ppo.simu.operators.v3_block import build_v3_pattern
+from verl.trainer.ppo.simu.operators.v3_config import V3Config
+from verl.trainer.ppo.simu.workload_context import Workload, WorkloadContext
+
+
+# ---- hardware -----------------------------------------------------------------
+
+A100_80GB = HardwareSpec(
+    peak_compute_flops=312e12,
+    peak_memory_bandwidth=2.0e12,
+    ridge_flops_per_byte=156.0,
+    # default efficiency factors: 0.7 / 0.8 / 0.4
+)
+
+H100_80GB = HardwareSpec(
+    peak_compute_flops=989e12,
+    peak_memory_bandwidth=3.35e12,
+    ridge_flops_per_byte=295.0,
+)
+
+
+# ---- architectures ------------------------------------------------------------
+
+LLAMA2_7B = LlamaConfig(
+    h=4096,
+    n_layers=32,
+    n_q=32,
+    n_kv=32,  # MHA, not GQA
+    head_size=128,
+    m=11008,
+    rope_dim=128,
+    vocab=32000,
+    flash_block_size=64,
+    dtype_bytes=2,
+)
+
+LLAMA3_8B = LlamaConfig(
+    h=4096,
+    n_layers=32,
+    n_q=32,
+    n_kv=8,
+    head_size=128,
+    m=14336,
+    rope_dim=128,
+    vocab=128_000,
+    flash_block_size=64,
+    dtype_bytes=2,
+)
+
+LLAMA3_70B = LlamaConfig(
+    h=8192,
+    n_layers=80,
+    n_q=64,
+    n_kv=8,
+    head_size=128,
+    m=28672,
+    rope_dim=128,
+    vocab=128_000,
+    flash_block_size=64,
+    dtype_bytes=2,
+)
+
+DEEPSEEK_V3 = V3Config()  # the existing defaults are V3 spec
+
+
+# ---- scenario type ------------------------------------------------------------
+
+
+@dataclass
+class Scenario:
+    name: str
+    description: str
+    architecture: ArchitectureConfig
+    build_pattern: Callable[..., list[PatternEntry]]
+    parallelism: ParallelismConfig
+    hardware: HardwareSpec
+    workload: Workload
+    workload_ctx: WorkloadContext
+    reference_latency_ms: float
+    tolerance_percent: float = 50.0
+    metric: str = "total"  # or "decode_step"
+    spine_bandwidth_gbps: float = 4800.0  # NVLink-class shared spine; tuned per-scenario
+
+
+# ---- scenario instances -------------------------------------------------------
+
+
+SCENARIOS: list[Scenario] = [
+    Scenario(
+        name="llama2_7b_prefill_a100",
+        description="Llama-2-7B prefill, batch=1, prompt=512, single A100-80GB. Reference ~50ms (vLLM).",
+        architecture=LLAMA2_7B,
+        build_pattern=build_llama_pattern,
+        parallelism=ParallelismConfig(tp=1, pp=1, dp=1, ep=1),
+        hardware=A100_80GB,
+        workload=Workload.PREPARATION,
+        workload_ctx=WorkloadContext(
+            workload_type=Workload.PREPARATION,
+            batch_size=1, microbatch_size=1,
+            prompt_len=512, response_len=0, num_microbatches=1,
+        ),
+        reference_latency_ms=50.0,
+        tolerance_percent=50.0,
+        metric="total",
+        spine_bandwidth_gbps=4800.0,
+    ),
+    Scenario(
+        name="llama2_7b_decode_a100",
+        description="Llama-2-7B decode, batch=1, single A100-80GB. Reference ~25ms/token (vLLM).",
+        architecture=LLAMA2_7B,
+        build_pattern=build_llama_pattern,
+        parallelism=ParallelismConfig(tp=1, pp=1, dp=1, ep=1),
+        hardware=A100_80GB,
+        workload=Workload.GENERATION,
+        # response_len=1 → decode_time == one-step latency
+        workload_ctx=WorkloadContext(
+            workload_type=Workload.GENERATION,
+            batch_size=1, microbatch_size=1,
+            prompt_len=512, response_len=1, num_microbatches=1,
+        ),
+        reference_latency_ms=25.0,
+        tolerance_percent=50.0,
+        metric="decode_step",
+        spine_bandwidth_gbps=4800.0,
+    ),
+    Scenario(
+        name="llama3_70b_prefill_8xa100_tp8",
+        description="Llama-3-70B prefill, batch=1, prompt=2048, 8xA100-80GB TP=8. Reference ~250ms.",
+        architecture=LLAMA3_70B,
+        build_pattern=build_llama_pattern,
+        parallelism=ParallelismConfig(tp=8, pp=1, dp=1, ep=1),
+        hardware=A100_80GB,
+        workload=Workload.PREPARATION,
+        workload_ctx=WorkloadContext(
+            workload_type=Workload.PREPARATION,
+            batch_size=1, microbatch_size=1,
+            prompt_len=2048, response_len=0, num_microbatches=1,
+        ),
+        reference_latency_ms=250.0,
+        tolerance_percent=50.0,
+        metric="total",
+        spine_bandwidth_gbps=4800.0,  # NVLink-class intra-node
+    ),
+    Scenario(
+        name="llama3_8b_training_8xa100_tp2_pp2_dp2",
+        description=(
+            "Llama-3-8B training step, batch=64, microbatch=4, prompt=2048, "
+            "8xA100-80GB TP=2 PP=2 DP=2. Reference ~3-5s (Megatron-class). Sanity bound."
+        ),
+        architecture=LLAMA3_8B,
+        build_pattern=build_llama_pattern,
+        parallelism=ParallelismConfig(tp=2, pp=2, dp=2, ep=1),
+        hardware=A100_80GB,
+        workload=Workload.TRAINING,
+        # Operators size off batch_size×prompt_len (per-microbatch token count).
+        # num_microbatches is per-DP-rank since the pipeline formula loops it
+        # within one DP rank: global_batch / dp / microbatch_size = 64/2/4 = 8.
+        workload_ctx=WorkloadContext(
+            workload_type=Workload.TRAINING,
+            batch_size=4, microbatch_size=4,
+            prompt_len=2048, response_len=0, num_microbatches=8,
+        ),
+        reference_latency_ms=4000.0,  # midpoint of 3-5s
+        tolerance_percent=100.0,  # explicit "sanity bound, not tight target"
+        metric="total",
+        spine_bandwidth_gbps=4800.0,
+    ),
+    Scenario(
+        name="deepseek_v3_prefill_32xh100_ep32",
+        description="DeepSeek-V3 prefill, batch=1, prompt=4096, 32xH100-80GB EP=32 TP=1 PP=1. Reference ~500ms (looser bound).",
+        architecture=DEEPSEEK_V3,
+        build_pattern=build_v3_pattern,
+        parallelism=ParallelismConfig(tp=1, pp=1, dp=1, ep=32),
+        hardware=H100_80GB,
+        workload=Workload.PREPARATION,
+        workload_ctx=WorkloadContext(
+            workload_type=Workload.PREPARATION,
+            batch_size=1, microbatch_size=1,
+            prompt_len=4096, response_len=0, num_microbatches=1,
+        ),
+        reference_latency_ms=500.0,
+        tolerance_percent=100.0,  # V3 numbers are less stable
+        metric="total",
+        spine_bandwidth_gbps=7200.0,  # H100 NVLink-class
+    ),
+]

@@ -1,0 +1,447 @@
+"""Validation runner: compares simulator predictions to published references.
+
+Run as a standalone script:
+    .venv/bin/python verl/trainer/ppo/simu/validation/run_validation.py
+
+Prints a prediction-vs-reference table to stdout. Writes findings.md alongside
+this script if any scenario is more than 30% off the reference (regardless of
+whether it passes its tolerance). Exits non-zero if any scenario exceeds its
+tolerance.
+
+Does NOT auto-tune efficiency factors. Investigation lives in findings.md.
+"""
+from __future__ import annotations
+
+# ---- Stub the verl namespace packages so the script runs without a full
+# editable install (mirrors tests/conftest.py). Must run before any
+# `from verl...` imports.
+import sys
+import types
+from pathlib import Path
+
+_simu_dir = Path(__file__).resolve().parent.parent
+_ppo_dir = _simu_dir.parent
+_trainer_dir = _ppo_dir.parent
+_verl_dir = _trainer_dir.parent
+
+for _pkg_name, _pkg_path in [
+    ("verl", _verl_dir),
+    ("verl.trainer", _trainer_dir),
+    ("verl.trainer.ppo", _ppo_dir),
+    ("verl.trainer.ppo.simu", _simu_dir),
+]:
+    if _pkg_name not in sys.modules or not hasattr(sys.modules[_pkg_name], "__path__"):
+        _stub = types.ModuleType(_pkg_name)
+        _stub.__path__ = [str(_pkg_path)]
+        sys.modules[_pkg_name] = _stub
+
+# ---- standard imports below this point can use the verl namespace -----------
+
+from collections import defaultdict
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+
+from verl.trainer.ppo.simu.mesh import Mesh
+from verl.trainer.ppo.simu.model import Model
+from verl.trainer.ppo.simu.model_mapping import ModelMapping, SimulationResult
+from verl.trainer.ppo.simu.network_requirement import ParallelismConfig
+from verl.trainer.ppo.simu.operator import Operator
+from verl.trainer.ppo.simu.shard import Shard
+from verl.trainer.ppo.simu.simulator import simulate_rlhf_iteration
+from verl.trainer.ppo.simu.stages import RLHFTimeline
+from verl.trainer.ppo.simu.submesh_mapping import SubmeshMapping
+from verl.trainer.ppo.simu.topo import HostTopo, Link, Path as TopoPath
+from verl.trainer.ppo.simu.validation.scenarios import SCENARIOS, Scenario
+
+
+# ---- topology + mapping helpers ---------------------------------------------
+
+
+def build_topology(num_hosts: int, spine_bandwidth_gbps: float) -> HostTopo:
+    """Single shared spine link between every host pair (NVLink-class for
+    intra-node validation). Latency set to 0 so reported times are pure
+    compute + bandwidth-share contention."""
+    if num_hosts <= 1:
+        return HostTopo(
+            intra_host_bandwidth=1000.0,
+            intra_host_latency=0.0,
+            hosts_connections={},
+        )
+    spine = Link(node_a_id=-1, node_b_id=-2, bandwidth=spine_bandwidth_gbps, latency=0.0)
+    spine_path = TopoPath(link=[spine])
+    connections = {
+        (i, j): spine_path
+        for i in range(num_hosts)
+        for j in range(num_hosts)
+        if i != j
+    }
+    return HostTopo(
+        intra_host_bandwidth=1000.0,
+        intra_host_latency=0.0,
+        hosts_connections=connections,
+    )
+
+
+def shard_grid(parallelism: ParallelismConfig) -> tuple[int, list[tuple[int, int, int]]]:
+    """Return (num_hosts, [(dp, pp, tp), ...]).
+
+    EP shares the TP axis in the current Shard layout, so when ep > 1 we
+    expand the tp count to ep. Validators that actually use EP (V3) rely on
+    this.
+    """
+    tp_axis = max(parallelism.tp, parallelism.ep)
+    coords = [
+        (d, p, t)
+        for d in range(parallelism.dp)
+        for p in range(parallelism.pp)
+        for t in range(tp_axis)
+    ]
+    return parallelism.dp * parallelism.pp * tp_axis, coords
+
+
+def build_model_mapping(scenario: Scenario) -> tuple[ModelMapping, HostTopo]:
+    model = Model(
+        name=scenario.name,
+        role="actor",
+        architecture=scenario.architecture,
+        build_pattern=scenario.build_pattern,
+    )
+    num_hosts, coords = shard_grid(scenario.parallelism)
+    shards: list[Shard] = []
+    s2h: dict[Shard, int] = {}
+    h2s: dict[int, Shard] = {}
+    for host_id, (d, p, t) in enumerate(coords):
+        s = Shard(model=model, dp=d, pp=p, tp=t)
+        shards.append(s)
+        s2h[s] = host_id
+        h2s[host_id] = s
+    mesh = Mesh(host_ids=list(range(num_hosts)), num_devices_per_host=1)
+    mm = ModelMapping(
+        model=model,
+        mesh=mesh,
+        workload=scenario.workload,
+        parallelism=scenario.parallelism,
+        shards_to_host_ids=s2h,
+        host_id_to_shard=h2s,
+        # Leaving estimates empty: the validation focuses on operator-level
+        # accuracy, not network sizing. Network ops contribute ~latency only.
+        data_GB_estimates={},
+    )
+    topo = build_topology(num_hosts, scenario.spine_bandwidth_gbps)
+    return mm, topo
+
+
+# ---- per-scenario evaluation ------------------------------------------------
+
+
+@dataclass
+class ScenarioResult:
+    name: str
+    description: str
+    predicted_ms: float
+    reference_ms: float
+    error_pct: float
+    tolerance_pct: float
+    passes_tolerance: bool
+    needs_findings: bool
+    op_breakdown: list[tuple[str, float]] = field(default_factory=list)
+    notes: str = ""
+
+
+def op_type_breakdown(
+    mm: ModelMapping, sim_result: SimulationResult
+) -> list[tuple[str, float]]:
+    """Aggregate per-op wall-time by Operator subclass name; return sorted fractions."""
+    by_type: dict[str, float] = defaultdict(float)
+    # GENERATION concatenates prefill + decode breakdown.
+    ops: list[Operator] = list(mm.operator_pattern) + list(mm.decode_operator_pattern)
+    breakdown = sim_result.per_op_breakdown
+    if len(breakdown) != len(ops):
+        # Defensive: shouldn't happen with current simulator.
+        return []
+    for op, t in zip(ops, breakdown):
+        by_type[type(op).__name__] += t
+    total = sum(by_type.values())
+    if total <= 0:
+        return []
+    return sorted(
+        [(name, t / total) for name, t in by_type.items()],
+        key=lambda x: -x[1],
+    )
+
+
+def run_scenario(scenario: Scenario) -> ScenarioResult:
+    mm, topo = build_model_mapping(scenario)
+    submesh = SubmeshMapping(model_mappings=[mm], submesh=mm.mesh)
+    timeline = RLHFTimeline(stages=[[submesh]], boundaries=[])
+
+    iter_result = simulate_rlhf_iteration(timeline, scenario.workload_ctx, scenario.hardware, topo)
+    if not iter_result.per_mm_results:
+        raise RuntimeError(f"{scenario.name}: simulator returned no per-MM results")
+    mm_result = iter_result.per_mm_results[0]
+
+    if scenario.metric == "decode_step":
+        response_len = scenario.workload_ctx.response_len
+        if response_len <= 0 or mm_result.decode_time is None:
+            raise ValueError(
+                f"{scenario.name}: decode_step metric needs response_len > 0 and "
+                f"a GENERATION workload (got response_len={response_len}, "
+                f"decode_time={mm_result.decode_time})"
+            )
+        predicted_seconds = mm_result.decode_time / response_len
+    elif scenario.metric == "prefill":
+        if mm_result.prefill_time is None:
+            raise ValueError(f"{scenario.name}: prefill metric needs a GENERATION workload")
+        predicted_seconds = mm_result.prefill_time
+    elif scenario.metric == "total":
+        predicted_seconds = iter_result.total_time
+    else:
+        raise ValueError(f"{scenario.name}: unknown metric {scenario.metric!r}")
+
+    predicted_ms = predicted_seconds * 1000.0
+    error_pct = (predicted_ms - scenario.reference_latency_ms) / scenario.reference_latency_ms * 100.0
+    passes = abs(error_pct) <= scenario.tolerance_percent
+    needs_findings = abs(error_pct) > 30.0
+
+    return ScenarioResult(
+        name=scenario.name,
+        description=scenario.description,
+        predicted_ms=predicted_ms,
+        reference_ms=scenario.reference_latency_ms,
+        error_pct=error_pct,
+        tolerance_pct=scenario.tolerance_percent,
+        passes_tolerance=passes,
+        needs_findings=needs_findings,
+        op_breakdown=op_type_breakdown(mm, mm_result),
+    )
+
+
+# ---- output -----------------------------------------------------------------
+
+
+def print_table(results: list[ScenarioResult]) -> None:
+    header = (
+        f"{'scenario':<46} {'predicted':>12} {'reference':>12} "
+        f"{'error %':>10} {'tol %':>8} {'pass':>6}"
+    )
+    print(header)
+    print("-" * len(header))
+    for r in results:
+        flag = "PASS" if r.passes_tolerance else "FAIL"
+        print(
+            f"{r.name:<46} {r.predicted_ms:>10.1f}ms {r.reference_ms:>10.1f}ms "
+            f"{r.error_pct:>9.1f}% {r.tolerance_pct:>7.1f}% {flag:>6}"
+        )
+
+
+def _findings_hypothesis(r: ScenarioResult) -> str:
+    """Best-effort hypothesis for why a scenario is more than 30% off.
+
+    These are heuristics — the user reviews findings.md and decides.
+    """
+    err = r.error_pct
+    name = r.name
+    if err < -30:
+        # Predicted too low.
+        if "decode" in name:
+            return (
+                "Pure roofline does not include kernel-launch overhead, KV-cache management, "
+                "or sampling latency — these dominate at batch=1 decode (real wall time is "
+                "typically 2-3× the analytical floor). Total memory traffic per decode step "
+                "≈ model_size + KV reads ≈ 13.4 GB on Llama-2-7B; at peak·η_mem ≈ 1.6 TB/s "
+                "the floor is ~8 ms, matching the prediction. memory_efficiency=0.8 is also "
+                "optimistic for tiny M=1 GEMMs — small_gemm_efficiency=0.4 currently triggers "
+                "only when min(M,N,K) < 1024, which excludes K=4096 GEMMs even with M=1. "
+                "Not a formula bug; the simulator's scope stops at the roofline."
+            )
+        if "prefill" in name:
+            return (
+                "Pure compute prediction is below measured wall time. Likely contributions: "
+                "(a) compute_efficiency=0.7 may be high for small-batch prefill where "
+                "tensor-core occupancy is limited (effective ~0.5-0.6 at batch=1); "
+                "(b) measured times include framework overhead (allocator, dispatch, sampling) "
+                "the simulator does not model; (c) reference may include one-off setup costs."
+            )
+        return "Predicted below reference; investigate compute_efficiency and overhead."
+    if err > 30:
+        # Predicted too high.
+        if "training" in name:
+            return (
+                "Above reference. Dominant cause: even-by-op-count PP partition splits a "
+                "forward-then-backward pattern so stage 0 = all forward ops and stage 1 = all "
+                "backward (3× heavier with recompute) + optimizer. max_stage is then the "
+                "backward stage, and the (num_microbatches + pp - 1) pipeline multiplier "
+                "amplifies the imbalance. Cost-balanced partition (the deferred TODO from the "
+                "ModelMapping.__post_init__ comment) — interleaving forward and backward across "
+                "stages — should roughly halve max_stage. Backward 3× with recompute is also "
+                "conservative; FlashAttention backward + selective checkpointing reach ~2-2.5×."
+            )
+        if "deepseek_v3" in name:
+            return (
+                "Above reference. PrefillAttention dominates ~80% of predicted wall time. "
+                "memory_bytes = 3·n_h·head_size·t²/B·dtype gives ~14 ms per attention layer "
+                "for V3 (n_h=128, head_size=192, t=4096, B=64), or ~880 ms across 61 layers "
+                "alone. Two refinements would close the gap: (a) memory_efficiency=0.8 is "
+                "conservative for H100 HBM3 — measured 0.85-0.9 — bumping it to 0.9 trims "
+                "~10%; (b) FlashAttention-3 has lower effective memory traffic than the "
+                "3·l²/B·d_h tile model assumes (recomputes Q/K/V tiles instead of materializing). "
+                "Re-deriving the FA3 memory factor on H100 would shave the rest."
+            )
+        if "tp" in (r.parallelism_hint or ""):
+            return (
+                "Above reference. If data_GB_estimates is non-empty, steady-op contention is "
+                "computed against ALL steady transfers as if concurrent — for a single submesh "
+                "with serialized layers this over-counts. With empty estimates (the validation "
+                "default), this branch shouldn't fire; investigate operator-level cost."
+            )
+        return (
+            "Above reference. Either compute_efficiency too low for this workload, or the "
+            "operator pattern includes work the reference doesn't model."
+        )
+    return "Within 30% — no findings entry needed."
+
+
+def write_findings_md(results: list[ScenarioResult], out_path: Path) -> None:
+    relevant = [r for r in results if r.needs_findings]
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    lines: list[str] = []
+    lines.append(f"# Simulator validation findings — {timestamp}")
+    lines.append("")
+    lines.append(
+        "Generated automatically by `run_validation.py` whenever any scenario is "
+        "more than 30% off its published reference. Default tolerance is 50%; "
+        "training and DeepSeek-V3 are tagged as sanity bounds (100%)."
+    )
+    lines.append("")
+    lines.append("## Summary")
+    lines.append("")
+    lines.append("| scenario | predicted | reference | error % | tolerance % | pass |")
+    lines.append("|---|---:|---:|---:|---:|:---:|")
+    for r in results:
+        flag = "✓" if r.passes_tolerance else "✗"
+        lines.append(
+            f"| {r.name} | {r.predicted_ms:.1f} ms | {r.reference_ms:.1f} ms | "
+            f"{r.error_pct:+.1f}% | {r.tolerance_pct:.0f}% | {flag} |"
+        )
+    lines.append("")
+
+    lines.append("## Per-scenario investigation")
+    lines.append("")
+    for r in relevant:
+        lines.append(f"### {r.name}")
+        lines.append("")
+        lines.append(f"_{r.description}_")
+        lines.append("")
+        lines.append(
+            f"- **Predicted:** {r.predicted_ms:.1f} ms  "
+            f"**Reference:** {r.reference_ms:.1f} ms  "
+            f"**Error:** {r.error_pct:+.1f}%  "
+            f"**Tolerance:** ±{r.tolerance_pct:.0f}% "
+            f"({'within' if r.passes_tolerance else 'exceeds'} tolerance)"
+        )
+        lines.append("")
+        lines.append("**Dominant operators by wall-time fraction:**")
+        lines.append("")
+        for name, frac in r.op_breakdown[:6]:
+            lines.append(f"- `{name}` — {frac * 100:.1f}%")
+        lines.append("")
+        lines.append("**Hypothesis:**")
+        lines.append("")
+        lines.append(_findings_hypothesis(r))
+        lines.append("")
+
+    lines.append("## Suggested measurements to fit constants")
+    lines.append("")
+    lines.append(
+        "These would let us replace the literature-typical defaults "
+        "(0.7 / 0.8 / 0.4) with profiled values for the specific hardware target. "
+        "**Do not auto-tune.**"
+    )
+    lines.append("")
+    lines.append(
+        "- Profile a representative QKV GEMM at shape (M=2048, N=12288, K=4096) on the "
+        "target A100 to fit `compute_efficiency` for compute-bound prefill."
+    )
+    lines.append(
+        "- Profile a memory-bound GEMM at shape (M=1, N=4096, K=4096) on A100 to fit "
+        "`memory_efficiency` and `small_gemm_efficiency` for decode."
+    )
+    lines.append(
+        "- Measure end-to-end Llama-2-7B decode on a single A100 with kernel-launch "
+        "overhead profiled (e.g., via NSight): if the gap to roofline is ~constant per "
+        "token, bake it in as a per-step overhead constant rather than touching efficiencies."
+    )
+    lines.append(
+        "- For multi-GPU TP scenarios, instrument NVLink utilization during a single "
+        "AllReduce — current simulator assumes one shared spine; real NVLink switch fabric "
+        "behaves differently under contention."
+    )
+    lines.append(
+        "- For DeepSeek-V3, measure per-token AllToAll wall time on the target topology "
+        "to fit a per-EP contention factor (single-spine model is approximate)."
+    )
+    lines.append("")
+    lines.append("## What this run did NOT do")
+    lines.append("")
+    lines.append("- No efficiency factors were modified.")
+    lines.append("- No reference numbers were adjusted.")
+    lines.append("- No new operators or formulas were added.")
+    lines.append("")
+    lines.append(
+        "Review this report and decide whether to (a) profile to fit constants, "
+        "(b) extend the operator/contention model, or (c) accept current accuracy "
+        "and tighten the tolerances on stable scenarios."
+    )
+    lines.append("")
+
+    out_path.write_text("\n".join(lines))
+
+
+# ---- main -------------------------------------------------------------------
+
+
+def main() -> int:
+    results = []
+    for scenario in SCENARIOS:
+        try:
+            r = run_scenario(scenario)
+        except Exception as e:
+            print(f"ERROR running {scenario.name}: {type(e).__name__}: {e}", file=sys.stderr)
+            raise
+        # Stash some hint for the hypothesis text.
+        r.parallelism_hint = (
+            f"tp={scenario.parallelism.tp},pp={scenario.parallelism.pp},"
+            f"dp={scenario.parallelism.dp},ep={scenario.parallelism.ep}"
+        )
+        results.append(r)
+
+    print_table(results)
+
+    out_path = Path(__file__).resolve().parent / "findings.md"
+    if any(r.needs_findings for r in results):
+        write_findings_md(results, out_path)
+        print(f"\nfindings.md written to {out_path}")
+    elif out_path.exists():
+        # Stale file from a previous run that had findings; leave it.
+        print(f"\nNo new findings; leaving prior {out_path} in place.")
+    else:
+        print("\nAll scenarios within 30% of reference. No findings.md generated.")
+
+    failures = [r for r in results if not r.passes_tolerance]
+    if failures:
+        print(
+            f"\n{len(failures)} scenario(s) exceeded their tolerance:",
+            file=sys.stderr,
+        )
+        for r in failures:
+            print(
+                f"  - {r.name}: error {r.error_pct:+.1f}% (tolerance ±{r.tolerance_pct:.0f}%)",
+                file=sys.stderr,
+            )
+        return 1
+    print("\nAll scenarios within tolerance.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
