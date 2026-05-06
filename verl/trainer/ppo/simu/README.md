@@ -186,9 +186,8 @@ that every emitted op is BOUNDARY-phase.
 
 ## Known limitations
 
-a. **Host-level granularity hides intra-node fabric topology** — TP=8
-   on 8 GPUs in one node is treated as eight separate hosts on a shared
-   spine. Real NVLink switch fabric behaves differently under contention.
+a. **Host-level granularity hides intra-node fabric topology** Intra-node
+   transfers do not face contention.
 
 b. **Bidirectional links require explicit directed-pair construction**
    in the topology, otherwise full-duplex contention is double-counted

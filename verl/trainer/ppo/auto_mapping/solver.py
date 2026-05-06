@@ -18,7 +18,7 @@ class Workload:
     d_in: int # input sequence length
     d_out: int # output sequence length
     compute_type: str # "training", "inference", or "generation"
-    
+
 class PhysicalDeviceMesh:
 	def __init__(self, host_ids, host_info, num_hosts, num_devices_per_host):
 		self.host_ids = host_ids # list[int]
@@ -28,7 +28,7 @@ class PhysicalDeviceMesh:
 		self.num_devices = num_hosts * num_devices_per_host # int
 
 class LogicalDeviceMesh:
-	def __init__(self, physical_mesh, id_mesh, mesh_alpha=None, mesh_beta=None):
+	def __init__(self, physical_mesh, id_mesh, mesh_alpha=None, mesh_beta=None, assignment=None):
 		self.physical_mesh = physical_mesh # PhysicalDeviceMesh
 		self.id_mesh = np.array(id_mesh) # np.array - logical grid of device IDs
 		self.flattened_id_mesh = tuple(int(x) for x in id_mesh.flatten()) # tuple[int] - flattened logical grid of device IDs
@@ -38,9 +38,13 @@ class LogicalDeviceMesh:
 			mesh_beta = [1.0] * len(id_mesh.shape)
 		self.mesh_alpha = mesh_alpha # list[float] - per-mesh-dimension latency coefficients
 		self.mesh_beta = mesh_beta # list[float] - per-mesh-dimension bandwidth coefficients
-    
+		# Optional: a GroupAssignment from assign_machines_greedy. The simu
+		# bridge reads this to map (P, T, D) ranks onto physical hosts.
+		# Left None when no topology / bridge is in use.
+		self.assignment = assignment
+
 class Solver:
-	def __init__(self, D, L, W, N, M, Q, topology=None, role_worker_mapping=None):
+	def __init__(self, D, L, W, N, M, Q, topology=None, role_worker_mapping=None, bridge=None):
 		self.D = D # list[tuple[int, int]] - RLHF dataflow graph DAG edges
 		self.L = L # list[Role] - LLMs in RLHF dataflow
 		self.W = W # dict[int, Workload] - workload of LLMs in RLHF dataflow
@@ -49,8 +53,19 @@ class Solver:
 		self.Q = Q # int - memory capacity per GPU
 		self.topology = topology # topology - physical bandwidth tiers; for ray_config export
 		self.role_worker_mapping = role_worker_mapping # dict[Role, WorkerType] - solver-id i in list(role_worker_mapping)[i]
-	
-	def compute_cost(self, g, l_parallel):
+		self.bridge = bridge # simu.bridge.AutoMappingBridge or None; replaces compute_cost stub when set
+
+	def compute_cost(self, g, l_parallel, assignments=None):
+		# Bridge path: full RLHF iteration cost via simulate_rlhf_iteration.
+		if self.bridge is not None:
+			if assignments is None:
+				raise ValueError(
+					"compute_cost: bridge is set but assignments is None; "
+					"solve() must pass the current iteration's assignments through."
+				)
+			return self.bridge.simulate_iteration(g, l_parallel, self.W, assignments)
+
+		# Legacy stub (unchanged from prior behavior).
 		s = 3 # number of stages in D
 		c = [0] * s # computation cost per stage
 
@@ -83,10 +98,18 @@ class Solver:
 				for i, group in enumerate(g):
 					h, w = submeshes[i]
 					id_mesh = np.arange(h * w).reshape((h, w))
-					device_mesh = LogicalDeviceMesh(physical_mesh=None, id_mesh=id_mesh)
+					# Attach the GroupAssignment for this group so the simu
+					# bridge (consulted by auto_parallel.simulate via the
+					# simulators module) can place ranks on physical hosts.
+					assignment_for_group = assignments[i] if assignments is not None else None
+					device_mesh = LogicalDeviceMesh(
+						physical_mesh=None,
+						id_mesh=id_mesh,
+						assignment=assignment_for_group,
+					)
 					for l in group:
 						l_parallel[l] = auto_parallel(l, A_min, self.W[l], device_mesh)
-				cost = self.compute_cost(g, l_parallel)
+				cost = self.compute_cost(g, l_parallel, assignments=assignments)
 				if cost < best_cost:
 					best_cost = cost
 					best_mapping = (g, submeshes, l_parallel)
