@@ -30,12 +30,22 @@ def export_solver_result(
     l_parallel,
     assignments,
     role_worker_mapping: dict[Any, Any],
+    l_gen_parallel: dict[int, tuple] | None = None,
 ):
+    """Convert solver output into ResourcePoolManager-shaped data.
+
+    `l_gen_parallel` (optional) maps dual-layout role_id → (p_g, t_g, d_g_outer)
+    for the generation side. When present, the per-role overrides emit the gen
+    values for rollout-side OmegaConf paths and the train values for
+    Megatron-side paths. When absent (or empty), gen falls back to using the
+    train layout — preserving the legacy single-layout output.
+    """
     # roles = role_order_mapping.keys() in iteration order; solver-id i corresponds to roles[i]
     roles = list(role_worker_mapping.keys())
     resource_pool_spec: dict[str, list[int]] = {}
     mapping: dict[Any, str] = {}
     overrides: dict[Any, dict[str, int]] = {}
+    l_gen_parallel = l_gen_parallel or {}
 
     for group_idx, group in enumerate(g):
         assignment = assignments[group_idx]
@@ -48,7 +58,13 @@ def export_solver_result(
             mapping[role] = pool_name
             if role_id in l_parallel:
                 p, t, d = l_parallel[role_id]
-                overrides[role] = _parallelism_keys_for_role(role, p=p, t=t, d=d)
+                if role_id in l_gen_parallel:
+                    p_g, t_g, _d_g_outer = l_gen_parallel[role_id]
+                else:
+                    p_g, t_g = p, t
+                overrides[role] = _parallelism_keys_for_role(
+                    role, p=p, t=t, d=d, p_gen=p_g, t_gen=t_g,
+                )
 
     return resource_pool_spec, mapping, overrides
 
@@ -67,12 +83,31 @@ def apply_parallelism_overrides(config, overrides: dict[Any, dict[str, int]]) ->
             else:
                 _setattr_path(config, path, value)
 
-def _parallelism_keys_for_role(role, *, p: int, t: int, d: int) -> dict[str, int]:
+def _parallelism_keys_for_role(
+    role, *, p: int, t: int, d: int, p_gen: int | None = None, t_gen: int | None = None,
+) -> dict[str, int]:
+    """OmegaConf paths to override for a given Role's selected parallelism.
+
+    `p`, `t`, `d` are the train-side (Megatron) parallelism. `p_gen` and
+    `t_gen` are the generation-side (vLLM rollout) parallelism for
+    dual-layout roles. When `p_gen` / `t_gen` are None, the gen side uses
+    the train values (legacy single-layout behavior).
+    """
+    if p_gen is None:
+        p_gen = p
+    if t_gen is None:
+        t_gen = t
     if role in (Role.ActorRollout, Role.ActorRolloutRef, Role.Actor):
         return {
             "actor_rollout_ref.actor.megatron.tensor_model_parallel_size": t,
             "actor_rollout_ref.actor.megatron.pipeline_model_parallel_size": p,
-            "actor_rollout_ref.rollout.tensor_model_parallel_size": t,
+            # vLLM / sglang honor rollout PP at runtime (default 1 in
+            # rollout.yaml). trtllm asserts ==1; if we ever target it we'll
+            # need to clamp p_gen=1 in the search. For now, surface what the
+            # solver picked so the deployed layout matches the simulator's
+            # cost model.
+            "actor_rollout_ref.rollout.tensor_model_parallel_size": t_gen,
+            "actor_rollout_ref.rollout.pipeline_model_parallel_size": p_gen,
         }
     if role == Role.Critic:
         return {

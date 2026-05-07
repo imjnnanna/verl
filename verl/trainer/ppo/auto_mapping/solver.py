@@ -5,6 +5,8 @@
 # parallelism_overrides: dict[Role, dict]
 
 from dataclasses import dataclass, field
+from typing import Optional
+import itertools
 from .enumerators import enum_placement_groups, enum_submesh_shapes
 from .auto_parallel import auto_parallel
 from .mem_model import get_min_alloc
@@ -32,20 +34,34 @@ class DeviceMesh:
 @dataclass
 class DataflowGraph:
     edges: list[tuple[int, int]]
-    stages: list[list[int]] # list of stages, each stage is a list of LLM indices
-    role_to_stage: dict[int, int] = field(init=False) 
-    
+    stages: list[list[int]]  # list of stages, each stage is a list of LLM indices
+    # Per-stage workload type label parallel to `stages`: one of
+    # "generation" / "inference" / "training". Optional; required for the
+    # bridge to model 3D-HybridEngine resharding (so a dual-layout role
+    # uses GENERATION workload in the gen-stage and TRAINING in the
+    # train-stage rather than its single per-model compute_type).
+    stage_workload_types: Optional[list[str]] = None
+    role_to_stage: dict[int, int] = field(init=False)
+
     def __post_init__(self):
+        if self.stage_workload_types is not None and len(self.stage_workload_types) != len(self.stages):
+            raise ValueError(
+                f"stage_workload_types length {len(self.stage_workload_types)} != "
+                f"stages length {len(self.stages)}"
+            )
+        # Last-write semantics for roles in multiple stages (dual-layout
+        # actor appears in both gen and train stages). Callers needing
+        # per-stage role placement should query `roles_in_stage(i)` directly.
         self.role_to_stage = {
             role: i
-            for i, stage in enumerate(self.stages) 
+            for i, stage in enumerate(self.stages)
             for role in stage
         }
-    
+
     @property
     def num_stages(self) -> int:
         return len(self.stages)
-    
+
     def roles_in_stage(self, stage_idx: int) -> list[int]:
         return self.stages[stage_idx]
     
@@ -67,14 +83,20 @@ class Solver:
         self.bridge = bridge
 
     def compute_cost(self, g, l_cost, l_parallel=None, assignments=None):
+        """Score a candidate (g, submeshes, l_parallel).
+
+        Returns `(cost, gen_parallel)` where `gen_parallel` is a
+        `dict[role_id, (p_g, t_g, d_g_outer)]` for dual-layout roles
+        (empty dict otherwise). The bridge path enumerates valid gen
+        layouts and returns the argmin; the legacy aggregator returns
+        `(cost, {})`.
+        """
         # Bridge path: full RLHF iteration cost via simulate_rlhf_iteration.
         # Needs l_parallel and assignments because the bridge re-builds the
         # operator graph for each (g, submeshes) candidate; per-model l_cost
         # alone isn't enough.
         if self.bridge is not None and l_parallel is not None and assignments is not None:
-            return self.bridge.simulate_iteration(
-                g, l_parallel, self.W, assignments, dataflow_graph=self.D
-            )
+            return self._compute_cost_bridge(g, l_parallel, assignments)
 
         # Aggregator over precomputed per-model l_cost (legacy path; also the
         # fallback when bridge isn't fully wired).
@@ -88,7 +110,107 @@ class Solver:
                     if l in self.D.roles_in_stage(i):
                         c_g[i] += l_cost[l]
                 c[i] = max(c[i], c_g[i])
-        return sum(c)
+        return sum(c), {}
+
+    # ----- bridge-path: joint (train, gen) layout search ---------------
+
+    def _compute_cost_bridge(self, g, l_parallel, assignments):
+        """Bridge path: enumerate gen layouts for dual-layout roles.
+
+        For each dual-layout role's train (p, t, d), enumerate all
+        `(p_g, t_g)` divisor pairs of `(p, t)`. The dest gen layout
+        is `(p_g, t_g, d * (p/p_g) * (t/t_g))` to keep total ranks
+        equal between training and generation (same physical pool, just
+        a relayout). Score every cartesian combination via
+        `bridge.simulate_iteration` and take the argmin.
+
+        Without dual-layout roles or without `stage_workload_types` on
+        the dag, no enumeration is possible — fall back to a single
+        `simulate_iteration` call (legacy bridge behavior, no resharding
+        cost contribution).
+        """
+        stage_workload_types = self.D.stage_workload_types
+        dual_layout_role_ids = self._dual_layout_role_ids(l_parallel)
+
+        if not dual_layout_role_ids or stage_workload_types is None:
+            cost = self.bridge.simulate_iteration(
+                g, l_parallel, self.W, assignments,
+                dataflow_graph=self.D,
+                stage_workload_types=stage_workload_types,
+            )
+            return cost, {}
+
+        per_role_options: dict[int, list[tuple[int, int, int]]] = {
+            rid: self._enumerate_gen_layouts(*l_parallel[rid])
+            for rid in dual_layout_role_ids
+        }
+        ordered_role_ids = list(per_role_options.keys())
+        option_lists = [per_role_options[rid] for rid in ordered_role_ids]
+
+        best_cost = float("inf")
+        best_gen: dict[int, tuple[int, int, int]] = {}
+        for combo in itertools.product(*option_lists):
+            gen_overrides = dict(zip(ordered_role_ids, combo))
+            stage_layouts = self._stage_layouts_for_gen(
+                l_parallel, gen_overrides, stage_workload_types
+            )
+            cost = self.bridge.simulate_iteration(
+                g, l_parallel, self.W, assignments,
+                dataflow_graph=self.D,
+                stage_layouts=stage_layouts,
+                stage_workload_types=stage_workload_types,
+            )
+            if cost < best_cost:
+                best_cost = cost
+                best_gen = gen_overrides
+        return best_cost, best_gen
+
+    def _dual_layout_role_ids(self, l_parallel) -> list[int]:
+        """Solver-id integers (keys of l_parallel) whose Role is dual-layout."""
+        if not self.role_worker_mapping:
+            return []
+        roles = list(self.role_worker_mapping.keys())
+        out: list[int] = []
+        for rid in l_parallel:
+            if 0 <= rid < len(roles) and roles[rid].is_dual_layout():
+                out.append(rid)
+        return out
+
+    @staticmethod
+    def _enumerate_gen_layouts(p_train: int, t_train: int, d_train: int) -> list[tuple[int, int, int]]:
+        """Enumerate (p_g, t_g, d_g_outer) gen layouts for a given train (p, t, d).
+
+        Constraints (from ZeroRedundancyStrategy):
+          p_g divides p,  t_g divides t,  d_g_outer = d * (p/p_g) * (t/t_g).
+
+        Always includes the train layout itself (p_g=p, t_g=t → no
+        resharding) and the vLLM "no PP" heuristic (p_g=1, t_g=t).
+        """
+        p_divs = [d for d in range(1, p_train + 1) if p_train % d == 0]
+        t_divs = [d for d in range(1, t_train + 1) if t_train % d == 0]
+        return [
+            (p_g, t_g, d_train * (p_train // p_g) * (t_train // t_g))
+            for p_g in p_divs
+            for t_g in t_divs
+        ]
+
+    def _stage_layouts_for_gen(
+        self,
+        l_parallel,
+        gen_overrides: dict,
+        stage_workload_types: list[str],
+    ) -> list[dict]:
+        """Build per-stage layout overrides: dual-layout roles use the gen
+        layout in any "generation" stage, the train layout (`l_parallel`)
+        elsewhere. Non-dual-layout roles aren't included (bridge falls back
+        to `l_parallel` for them)."""
+        stage_layouts: list[dict] = []
+        for wt in stage_workload_types:
+            stage_layout: dict = {}
+            for rid, gen_layout in gen_overrides.items():
+                stage_layout[rid] = gen_layout if wt == "generation" else l_parallel[rid]
+            stage_layouts.append(stage_layout)
+        return stage_layouts
 
     def solve(self) -> tuple[dict, dict, dict]:
         # return resource_pool_spec, mapping, parallelism_overrides
@@ -97,6 +219,7 @@ class Solver:
         best_cost = float('inf')
         best_mapping = None
         best_assignments = None
+        best_gen_parallel: dict = {}
 
         submesh_cache = {}   # min_area -> list of submesh configs from enum_submesh_shapes
         # ap_cache key includes the assignment's host signature when the bridge
@@ -150,13 +273,14 @@ class Solver:
                                     assignment=assignment_for_group,
                                 )
                             l_cost[l], l_parallel[l] = ap_cache[key]
-                    cost = self.compute_cost(
+                    cost, gen_parallel = self.compute_cost(
                         g, l_cost, l_parallel=l_parallel, assignments=assignments
                     )
                     if cost < best_cost:
                         best_cost = cost
                         best_mapping = (g, submeshes, l_parallel)
                         best_assignments = assignments
+                        best_gen_parallel = gen_parallel
         finally:
             # Restore prior bridge state so concurrent or nested solves don't
             # leak this Solver's bridge into other call sites.
@@ -176,7 +300,12 @@ class Solver:
         if self.topology is None or self.role_worker_mapping is None:
             return best_mapping
         g, submeshes, l_parallel = best_mapping
-        return export_solver_result(g, submeshes, l_parallel, best_assignments, self.role_worker_mapping)
+        if best_gen_parallel:
+            print(f"[solve] best gen layouts (per dual-layout role): {best_gen_parallel}")
+        return export_solver_result(
+            g, submeshes, l_parallel, best_assignments, self.role_worker_mapping,
+            l_gen_parallel=best_gen_parallel,
+        )
 
 # if __name__ == "__main__":
 #     # Example usage

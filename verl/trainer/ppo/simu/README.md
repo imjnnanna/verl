@@ -164,7 +164,11 @@ the specific measurements that would pin each constant.
 
 ## Resharding extensibility
 
-`ReshardingStrategy` (in `resharding.py`) is the pluggable interface:
+The resharding policy lives outside `simu/` so this module stays a pure
+latency scorer. Strategies are defined in `verl.trainer.ppo.resharding`
+and consumed here via `StageTransition` in `transition.py`.
+
+`ReshardingStrategy` is the pluggable interface:
 
 ```python
 class ReshardingStrategy(ABC):
@@ -172,17 +176,21 @@ class ReshardingStrategy(ABC):
     def compute_network_ops(self, source: ModelMapping, dest: ModelMapping) -> list[NetworkOp]: ...
 ```
 
-v1 ships with `NaiveP2PStrategy`: walks Llama parameter tensors under the
-natural Megatron sharding scheme (QKV column-parallel, O row-parallel,
-gate/up column-parallel, down row-parallel, embed/LM-head vocab-parallel),
-computes per-(src_host, dst_host) byte movement via slice-overlap
-arithmetic, aggregates per pair across all parameters, and emits one
-`P2P` per non-zero pair. V3/MoE resharding is left to a future strategy.
+`resharding/` ships with two implementations:
 
-A `HybridFlowMicroDPStrategy` could inject AllGathers within micro-DP
-groups instead of pure P2Ps; the framework consumes whatever NetworkOp
-subclasses the strategy returns, uniformly. `StageTransition` validates
-that every emitted op is BOUNDARY-phase.
+- `NaiveP2PStrategy` — walks Llama parameter tensors under the natural
+  Megatron sharding scheme (QKV column-parallel, O row-parallel, gate/up
+  column-parallel, down row-parallel, embed/LM-head vocab-parallel),
+  computes per-(src_host, dst_host) byte movement via slice-overlap
+  arithmetic, aggregates per pair across all parameters, and emits one
+  `P2P` per non-zero pair. V3/MoE resharding is left to a future strategy.
+- `ZeroRedundancyStrategy` — HybridFlow's 3D-HybridEngine micro-DP zero-
+  redundancy resharding, generalized to any (a, b) factorization of d_g
+  with a | p and b | t (no constraint that t_g and d_g divide t and d
+  individually). Each training rank emits exactly one P2P to its mapped
+  generation rank, and a d_g-way AllGather inside each micro-DP group
+  reassembles the full shard. `StageTransition` validates that every
+  emitted op is BOUNDARY-phase.
 
 ## Known limitations
 
@@ -289,8 +297,7 @@ verl/trainer/ppo/simu/
 ├── model_mapping.py           ← ModelMapping + simulate
 ├── submesh_mapping.py         ← SubmeshMapping + simulate_isolated
 ├── stages.py                  ← StageBoundary, RLHFTimeline
-├── transition.py              ← StageTransition
-├── resharding.py              ← ReshardingStrategy + NaiveP2PStrategy
+├── transition.py              ← StageTransition (consumes resharding/ strategies)
 ├── simulator.py               ← simulate_stage, simulate_rlhf_iteration
 ├── tests/                     ← pytest suite (Phases 1-4b)
 └── validation/                ← prediction-vs-reference harness (Phase 5)

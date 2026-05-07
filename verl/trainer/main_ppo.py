@@ -27,7 +27,7 @@ from verl.experimental.reward_loop import migrate_legacy_reward_impl
 from verl.trainer.constants_ppo import get_ppo_ray_runtime_env
 from verl.trainer.distillation import is_distillation_enabled
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
-from verl.trainer.ppo.utils import need_critic, need_reference_policy
+from verl.trainer.ppo.utils import Role, need_critic, need_reference_policy
 from verl.utils.config import validate_config
 from verl.utils.device import auto_set_device, is_cuda_available
 from verl.utils.import_utils import load_extern_object
@@ -37,7 +37,6 @@ from verl.trainer.ppo.auto_mapping.mem_model import ModelSpec
 from verl.trainer.ppo.simu.bridge import AutoMappingBridge
 from verl.trainer.ppo.simu.hardware import HardwareSpec
 from verl.trainer.ppo.ray_trainer import ResourcePoolManager
-from verl.trainer.ppo.ray_trainer import Role
 
 
 # H200 SXM 141GB hardware spec for the auto-mapping bridge.
@@ -298,11 +297,40 @@ class TaskRunner:
         # TODO: differentiate compute_type per role (after simulators support per-role compute_type)
         # W is keyed by integer index (matching enum_placement_groups's output indexing).
         W = {i: Workload(prompt_len, response_len, "training") for i in range(len(roles))}
-        # TODO: build real multi-stage dataflow (gen / prep / train). For now, single
-        # stage that contains every role -- compute_cost sums l_costs across all roles.
+        # Multi-stage RLHF dataflow, ordered [infer, train, gen]. This is
+        # the natural per-iter ordering for steady-state RLHF: iter N's gen
+        # output is consumed by iter N+1's infer/train, so the actor's
+        # train→gen resharding cost surfaces at the train→gen boundary
+        # WITHIN iter N (rather than across iter boundaries, which the
+        # simulator can't model). Per-iter wall time is invariant under
+        # this reordering — sum of stages + boundaries is unchanged.
+        #
+        # Dual-layout actors (HybridFlow 3D-HybridEngine) appear in BOTH
+        # the train and gen stages so the bridge sees the layout change
+        # and emits a ZeroRedundancyStrategy transition at the boundary.
+        # Forward-only roles (ref / RM) live in infer; critic in train.
+        # Empty stages are kept (the bridge filters them out) so
+        # `stage_workload_types` stays parallel-aligned.
+        infer_stage: list[int] = []
+        train_stage: list[int] = []
+        gen_stage: list[int] = []
+        for i, role in enumerate(roles):
+            if role.is_dual_layout():
+                train_stage.append(i)
+                gen_stage.append(i)
+            elif role == Role.Rollout:
+                gen_stage.append(i)
+            elif role in (Role.RefPolicy, Role.RewardModel):
+                infer_stage.append(i)
+            elif role in (Role.Actor, Role.Critic):
+                train_stage.append(i)
+            else:
+                # TeacherModel / Env / unknown: park in inference (forward-only).
+                infer_stage.append(i)
         D = DataflowGraph(
             edges=[(i, i + 1) for i in range(len(roles) - 1)],
-            stages=[list(range(len(roles)))],
+            stages=[infer_stage, train_stage, gen_stage],
+            stage_workload_types=["inference", "training", "generation"],
         )
         Q = int(config.trainer.get("auto_mapping", {}).get("per_gpu_budget_gb", 80)) * 1024 ** 3
 

@@ -57,9 +57,15 @@ class Role(Enum):
 
     def is_actor(self):
         return self in {Role.Actor, Role.ActorRollout, Role.ActorRolloutRef, Role.Rollout}
-    
+
     def is_ref(self):
         return self in {Role.RefPolicy, Role.ActorRolloutRef}
+
+    def is_dual_layout(self):
+        """True if this role hosts both train and generation layouts in one
+        iteration (i.e. uses HybridFlow's 3D-HybridEngine and pays a per-iter
+        train→gen resharding cost)."""
+        return self in {Role.ActorRollout, Role.ActorRolloutRef}
     
     @classmethod
     def from_string(cls, name: str):

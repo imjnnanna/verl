@@ -35,10 +35,16 @@ from verl.trainer.ppo.simu.network_requirement import ParallelismConfig
 from verl.trainer.ppo.simu.operators.llama_builder import build_llama_pattern
 from verl.trainer.ppo.simu.operators.llama_config import LlamaConfig
 from verl.trainer.ppo.simu.shard import Shard
+from verl.trainer.ppo.resharding import (
+    NaiveP2PStrategy,
+    ReshardingStrategy,
+    ZeroRedundancyStrategy,
+)
 from verl.trainer.ppo.simu.simulator import simulate_rlhf_iteration
 from verl.trainer.ppo.simu.stages import RLHFTimeline, StageBoundary
 from verl.trainer.ppo.simu.submesh_mapping import SubmeshMapping
 from verl.trainer.ppo.simu.topo import HostTopo, Link, Path
+from verl.trainer.ppo.simu.transition import StageTransition
 from verl.trainer.ppo.simu.workload_context import Workload, WorkloadContext
 
 if TYPE_CHECKING:
@@ -189,10 +195,7 @@ class AutoMappingBridge:
             print(f"Simulation result: cost={cost}")
             return cost
         except ValueError:
-            # Infeasible plan for this architecture / assignment shape — let
-            # the auto_parallel search skip this candidate. Programming errors
-            # (KeyError, TypeError, etc.) still propagate.
-            print(f"AutoMappingBridge.simulate_per_model: infeasible parallelism_plan={parallelism_plan} for model_id={model_id} with assignment={assignment}")
+            # Infeasible plan - let auto_parallel skip
             return float("inf")
 
     def simulate_iteration(
@@ -202,6 +205,8 @@ class AutoMappingBridge:
         workloads: dict[Any, "AutoWorkload"],
         assignments: list["GroupAssignment"],
         dataflow_graph: Optional["DataflowGraph"] = None,
+        stage_layouts: Optional[list[dict[Any, tuple[int, int, int]]]] = None,
+        stage_workload_types: Optional[list[str]] = None,
     ) -> float:
         """Build a full `RLHFTimeline` and run `simulate_rlhf_iteration`.
 
@@ -212,10 +217,33 @@ class AutoMappingBridge:
         grouping by `Workload.compute_type` against a hardcoded RLHF stage
         order.
 
-        Boundaries (resharding) are not modeled — auto_mapping doesn't
-        currently provide that information.
+        For 3D-HybridEngine resharding accuracy, supply `stage_layouts`
+        and/or `stage_workload_types` (each a list of length
+        `dataflow_graph.num_stages`):
+
+        - `stage_layouts[stage_idx][model_id]` overrides the (P, T, D)
+          parallelism for that model in that stage. Models without an
+          entry fall back to `l_parallel[model_id]`.
+        - `stage_workload_types[stage_idx]` is one of "generation" /
+          "inference" / "training" and overrides the per-MM `Workload`
+          for every model that appears in stage `stage_idx`. When None,
+          each MM uses its model's `compute_type` (legacy behavior).
+
+        Boundaries are emitted automatically: any model appearing in two
+        adjacent stages with a different (parallelism, workload) gets a
+        `StageTransition` whose strategy is selected by `_select_strategy`
+        — `ZeroRedundancyStrategy` for TRAINING → GENERATION, otherwise
+        `NaiveP2PStrategy`.
         """
-        timeline = self._build_timeline(g, l_parallel, workloads, assignments, dataflow_graph)
+        timeline = self._build_timeline(
+            g,
+            l_parallel,
+            workloads,
+            assignments,
+            dataflow_graph,
+            stage_layouts=stage_layouts,
+            stage_workload_types=stage_workload_types,
+        )
         ctx = self._reference_workload_context(workloads)
         result = simulate_rlhf_iteration(timeline, ctx, self.hardware, self._host_topo)
         return result.total_time
@@ -268,6 +296,37 @@ class AutoMappingBridge:
         gpus_per_host = max(assignment.gpus_per_host)
         return Mesh(host_ids=sim_host_ids, num_devices_per_host=gpus_per_host)
 
+    def _get_or_create_model(
+        self,
+        model_id: Any,
+        role: str,
+        cache: Optional[dict[Any, Model]] = None,
+    ) -> Model:
+        """Return a single Model instance per model_id within one timeline build.
+
+        StageTransition does an `is` identity check on `source.model` vs
+        `dest.model`, so the same `model_id` appearing in multiple stages
+        must reuse the same Model object. `role` is recorded from the first
+        construction; subsequent calls ignore it (cosmetic label only).
+        """
+        if cache is not None and model_id in cache:
+            return cache[model_id]
+        # TODO(architecture-resolution): Roles without an explicit entry fall
+        # back to the Qwen2.5-0.5B-Instruct hardwire. Replace with proper
+        # architecture resolution from `model_specs` (or caller-side wiring)
+        # before treating the bridge as production-ready for non-Qwen runs.
+        arch = self._archs.get(model_id, _QWEN2_5_0_5B_INSTRUCT)
+        build_pattern = self._build_patterns.get(model_id, _QWEN_BUILD_PATTERN)
+        model = Model(
+            name=f"auto_{model_id}",
+            role=role,
+            architecture=arch,
+            build_pattern=build_pattern,
+        )
+        if cache is not None:
+            cache[model_id] = model
+        return model
+
     def _model_mapping(
         self,
         model_id: Any,
@@ -275,31 +334,26 @@ class AutoMappingBridge:
         workload: "AutoWorkload",
         mesh: Mesh,
         assignment: "GroupAssignment",
+        *,
+        model: Optional[Model] = None,
+        sim_workload_override: Optional[Workload] = None,
     ) -> ModelMapping:
         ptd = _unpack_parallelism(parallelism_plan)
         p, t, d = ptd
         parallelism = ParallelismConfig(tp=t, pp=p, dp=d, ep=1)
 
-        sim_workload = _AUTO_TO_SIMU_WORKLOAD.get(workload.compute_type)
-        if sim_workload is None:
-            raise ValueError(
-                f"Unknown auto_mapping compute_type {workload.compute_type!r}; "
-                f"expected one of {list(_AUTO_TO_SIMU_WORKLOAD)}"
-            )
+        if sim_workload_override is not None:
+            sim_workload = sim_workload_override
+        else:
+            sim_workload = _AUTO_TO_SIMU_WORKLOAD.get(workload.compute_type)
+            if sim_workload is None:
+                raise ValueError(
+                    f"Unknown auto_mapping compute_type {workload.compute_type!r}; "
+                    f"expected one of {list(_AUTO_TO_SIMU_WORKLOAD)}"
+                )
 
-        # TODO(architecture-resolution): Roles without an explicit entry fall
-        # back to the Qwen2.5-0.5B-Instruct hardwire. Replace with proper
-        # architecture resolution from `model_specs` (or caller-side wiring)
-        # before treating the bridge as production-ready for non-Qwen runs.
-        arch = self._archs.get(model_id, _QWEN2_5_0_5B_INSTRUCT)
-        build_pattern = self._build_patterns.get(model_id, _QWEN_BUILD_PATTERN)
-
-        model = Model(
-            name=f"auto_{model_id}",
-            role=workload.compute_type,
-            architecture=arch,
-            build_pattern=build_pattern,
-        )
+        if model is None:
+            model = self._get_or_create_model(model_id, role=workload.compute_type)
 
         s2h, h2s = self._assign_shards(model, parallelism, mesh, assignment)
         return ModelMapping(
@@ -310,6 +364,19 @@ class AutoMappingBridge:
             shards_to_host_ids=s2h,
             host_id_to_shard=h2s,
         )
+
+    @staticmethod
+    def _select_strategy(src_workload: Workload, dst_workload: Workload) -> ReshardingStrategy:
+        """Pick the resharding strategy for a (src, dst) workload pair.
+
+        TRAINING → GENERATION uses HybridFlow's micro-DP zero-redundancy
+        sync (one P2P per training rank + a d_g-way AllGather inside each
+        micro-DP group). All other transitions fall back to the naive
+        per-tensor P2P strategy.
+        """
+        if src_workload is Workload.TRAINING and dst_workload is Workload.GENERATION:
+            return ZeroRedundancyStrategy()
+        return NaiveP2PStrategy()
 
     def _assign_shards(
         self,
@@ -407,16 +474,21 @@ class AutoMappingBridge:
         workloads: dict[Any, "AutoWorkload"],
         assignments: list["GroupAssignment"],
         dataflow_graph: Optional["DataflowGraph"] = None,
+        stage_layouts: Optional[list[dict[Any, tuple[int, int, int]]]] = None,
+        stage_workload_types: Optional[list[str]] = None,
     ) -> RLHFTimeline:
         """Build the RLHFTimeline for one (g, l_parallel, assignments) plan.
 
         With `dataflow_graph`: stage construction uses `dag.roles_in_stage(i)`
         — a model can appear in multiple stages, stage ordering is the dag's,
         and `compute_type` only feeds the per-MM `Workload` enum (not stage
-        placement).
+        placement). `stage_layouts` and `stage_workload_types` (each
+        list-of-length-num_stages) override per-stage parallelism and
+        workload, respectively, for accurate 3D-HybridEngine resharding.
 
         Without `dataflow_graph`: falls back to grouping by `compute_type`
-        against `_STAGE_ORDER`, the legacy behavior.
+        against `_STAGE_ORDER`, the legacy behavior. Per-stage overrides
+        are not applicable in that mode.
         """
         if len(assignments) != len(g):
             raise ValueError(
@@ -425,7 +497,18 @@ class AutoMappingBridge:
             )
         if dataflow_graph is not None:
             return self._build_timeline_from_dag(
-                g, l_parallel, workloads, assignments, dataflow_graph
+                g,
+                l_parallel,
+                workloads,
+                assignments,
+                dataflow_graph,
+                stage_layouts=stage_layouts,
+                stage_workload_types=stage_workload_types,
+            )
+        if stage_layouts is not None or stage_workload_types is not None:
+            raise ValueError(
+                "stage_layouts / stage_workload_types require a dataflow_graph; "
+                "they don't apply in the legacy compute_type fallback path."
             )
         return self._build_timeline_by_compute_type(
             g, l_parallel, workloads, assignments
@@ -483,36 +566,104 @@ class AutoMappingBridge:
         workloads: dict[Any, "AutoWorkload"],
         assignments: list["GroupAssignment"],
         dag: "DataflowGraph",
+        stage_layouts: Optional[list[dict[Any, tuple[int, int, int]]]] = None,
+        stage_workload_types: Optional[list[str]] = None,
     ) -> RLHFTimeline:
         """Use the explicit dag.stages structure for stage placement.
 
-        Each ModelMapping is built once per (group, model) pair, then placed
-        into every stage `i` with `model_id in dag.roles_in_stage(i)`. A
-        model that appears in multiple stages contributes its kernel time
-        independently in each — accurate for actor-style models that both
-        roll out and train within one iteration.
+        ModelMappings are built once per (group, model, parallelism, workload)
+        and reused across stages with identical layouts. A `Model` object
+        is cached per `model_id` so its identity survives across stages
+        (StageTransition does an `is` identity check on `source.model`).
+
+        With `stage_layouts` / `stage_workload_types`, each stage can use a
+        distinct (parallelism, workload) for the same model — required for
+        modeling 3D-HybridEngine where the actor uses different layouts in
+        the generation vs. training stages. Boundaries between adjacent
+        stages emit `StageTransition`s for every model that appears on
+        both sides with a different (parallelism, workload).
         """
+        n_stages = dag.num_stages
+        if stage_layouts is not None and len(stage_layouts) != n_stages:
+            raise ValueError(
+                f"stage_layouts has length {len(stage_layouts)} but dag has "
+                f"{n_stages} stages"
+            )
+        if stage_workload_types is not None:
+            if len(stage_workload_types) != n_stages:
+                raise ValueError(
+                    f"stage_workload_types has length {len(stage_workload_types)} "
+                    f"but dag has {n_stages} stages"
+                )
+            for i, wt in enumerate(stage_workload_types):
+                if wt not in _AUTO_TO_SIMU_WORKLOAD:
+                    raise ValueError(
+                        f"stage_workload_types[{i}]={wt!r} not in "
+                        f"{list(_AUTO_TO_SIMU_WORKLOAD)}"
+                    )
+
         group_meshes: dict[int, Mesh] = {}
-        # (group_idx, model_id) -> ModelMapping (built once, reused across stages)
-        model_mappings: dict[tuple[int, Any], ModelMapping] = {}
+        for group_idx, _ in enumerate(g):
+            group_meshes[group_idx] = self._mesh_for_assignment(assignments[group_idx])
 
-        for group_idx, group in enumerate(g):
-            assignment = assignments[group_idx]
-            mesh = self._mesh_for_assignment(assignment)
-            group_meshes[group_idx] = mesh
-            for model_id in group:
-                workload = workloads[model_id]
-                ptd = _unpack_parallelism(l_parallel[model_id])
-                mm = self._model_mapping(model_id, ptd, workload, mesh, assignment)
-                model_mappings[(group_idx, model_id)] = mm
+        # Reuse one Model instance per model_id so StageTransition's identity
+        # check on source.model holds across stages.
+        model_cache: dict[Any, Model] = {}
+        # Reuse one ModelMapping per distinct (group_idx, model_id, ptd, sim_workload).
+        mm_cache: dict[tuple[int, Any, tuple[int, int, int], Workload], ModelMapping] = {}
+        # (stage_idx, group_idx, model_id) -> ModelMapping in that stage.
+        per_stage_mm: dict[tuple[int, int, Any], ModelMapping] = {}
 
+        for stage_idx in range(n_stages):
+            roles_in_this_stage = set(dag.roles_in_stage(stage_idx))
+            for group_idx, group in enumerate(g):
+                for model_id in group:
+                    if model_id not in roles_in_this_stage:
+                        continue
+                    if stage_layouts and model_id in stage_layouts[stage_idx]:
+                        ptd = stage_layouts[stage_idx][model_id]
+                    else:
+                        ptd = _unpack_parallelism(l_parallel[model_id])
+                    if stage_workload_types is not None:
+                        sim_workload = _AUTO_TO_SIMU_WORKLOAD[stage_workload_types[stage_idx]]
+                    else:
+                        sim_workload = _AUTO_TO_SIMU_WORKLOAD.get(
+                            workloads[model_id].compute_type
+                        )
+                        if sim_workload is None:
+                            raise ValueError(
+                                f"Model {model_id} has unknown compute_type "
+                                f"{workloads[model_id].compute_type!r}"
+                            )
+                    cache_key = (group_idx, model_id, ptd, sim_workload)
+                    if cache_key not in mm_cache:
+                        model = self._get_or_create_model(
+                            model_id,
+                            role=workloads[model_id].compute_type,
+                            cache=model_cache,
+                        )
+                        mm_cache[cache_key] = self._model_mapping(
+                            model_id,
+                            ptd,
+                            workloads[model_id],
+                            group_meshes[group_idx],
+                            assignments[group_idx],
+                            model=model,
+                            sim_workload_override=sim_workload,
+                        )
+                    per_stage_mm[(stage_idx, group_idx, model_id)] = mm_cache[cache_key]
+
+        # Construct the per-stage SubmeshMappings, tracking which dag stages
+        # produced a non-empty stage in the timeline (so boundary lookups
+        # use the right stage indices).
         stages: list[list[SubmeshMapping]] = []
-        for stage_idx in range(dag.num_stages):
+        used_stage_indices: list[int] = []
+        for stage_idx in range(n_stages):
             roles_in_this_stage = set(dag.roles_in_stage(stage_idx))
             stage_submeshes: list[SubmeshMapping] = []
             for group_idx, group in enumerate(g):
                 mms = [
-                    model_mappings[(group_idx, mid)]
+                    per_stage_mm[(stage_idx, group_idx, mid)]
                     for mid in group
                     if mid in roles_in_this_stage
                 ]
@@ -523,9 +674,53 @@ class AutoMappingBridge:
                 )
             if stage_submeshes:
                 stages.append(stage_submeshes)
+                used_stage_indices.append(stage_idx)
 
-        boundaries = [StageBoundary(transitions=[]) for _ in range(max(0, len(stages) - 1))]
+        boundaries: list[StageBoundary] = []
+        for i in range(len(stages) - 1):
+            prev_idx = used_stage_indices[i]
+            next_idx = used_stage_indices[i + 1]
+            transitions = self._emit_boundary_transitions(
+                prev_idx, next_idx, dag, g, per_stage_mm
+            )
+            boundaries.append(StageBoundary(transitions=transitions))
+
         return RLHFTimeline(stages=stages, boundaries=boundaries)
+
+    def _emit_boundary_transitions(
+        self,
+        prev_stage_idx: int,
+        next_stage_idx: int,
+        dag: "DataflowGraph",
+        g: list[tuple[int, ...]],
+        per_stage_mm: dict[tuple[int, int, Any], ModelMapping],
+    ) -> list[StageTransition]:
+        """Emit transitions for models that span this boundary with a layout change.
+
+        A model appearing in both adjacent stages with the same parallelism
+        AND same workload doesn't need a transition (no bytes move); skip
+        it. Otherwise pick a strategy via `_select_strategy` and emit one
+        StageTransition per (group, model) pair.
+        """
+        prev_roles = set(dag.roles_in_stage(prev_stage_idx))
+        next_roles = set(dag.roles_in_stage(next_stage_idx))
+        common = prev_roles & next_roles
+        transitions: list[StageTransition] = []
+        for group_idx, group in enumerate(g):
+            for model_id in group:
+                if model_id not in common:
+                    continue
+                src = per_stage_mm.get((prev_stage_idx, group_idx, model_id))
+                dst = per_stage_mm.get((next_stage_idx, group_idx, model_id))
+                if src is None or dst is None:
+                    continue
+                if src.parallelism == dst.parallelism and src.workload == dst.workload:
+                    continue
+                strategy = self._select_strategy(src.workload, dst.workload)
+                transitions.append(
+                    StageTransition(source=src, dest=dst, strategy=strategy)
+                )
+        return transitions
 
 
 def _unpack_parallelism(value: Any) -> tuple[int, int, int]:
