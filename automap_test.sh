@@ -5,7 +5,7 @@
       algorithm.adv_estimator=gae
       data.train_files=$HOME/data/gsm8k/train.parquet                                                                                                                     
       data.val_files=$HOME/data/gsm8k/test.parquet
-      data.train_batch_size=56 # 64                                                                                                                                            
+      data.train_batch_size=64                                                                                                                                            
       data.max_prompt_length=512                                                                                                                                          
       data.max_response_length=512
       data.filter_overlong_prompts=True                                                                                                                                   
@@ -13,7 +13,7 @@
       actor_rollout_ref.model.path=Qwen/Qwen2.5-0.5B-Instruct
       actor_rollout_ref.actor.optim.lr=1e-6                                                                                                                               
       actor_rollout_ref.model.use_remove_padding=True
-      actor_rollout_ref.actor.ppo_mini_batch_size=28 #32                                                                                                                      
+      actor_rollout_ref.actor.ppo_mini_batch_size=32                                                                                                                      
       actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=2
       actor_rollout_ref.actor.fsdp_config.param_offload=False                                                                                                             
       actor_rollout_ref.actor.fsdp_config.optimizer_offload=False
@@ -29,7 +29,7 @@
       critic.fsdp.param_offload=False                                                                                                                                     
       critic.fsdp.optimizer_offload=False                                                                                                                                 
       algorithm.use_kl_in_reward=False
-      trainer.balance_batch=False #remove this for correct M
+      trainer.balance_batch=True #False
       trainer.critic_warmup=0                                                                                                                                             
       trainer.logger=[console]                                                                                                                                            
       trainer.project_name=auto_mapping_smoke
