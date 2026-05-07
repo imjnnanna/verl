@@ -134,6 +134,7 @@ class AutoMappingBridge:
         """
         if len(args) >= 4:
             assignment = kwargs.get("assignment")
+            print(f"AutoMappingBridge.simulate: dispatching to simulate_per_model with args={args[:4]} assignment={assignment}")
             return self.simulate_per_model(
                 args[0], args[1], args[2], args[3], assignment=assignment
             )
@@ -177,11 +178,22 @@ class AutoMappingBridge:
             mm = self._model_mapping(model_id, parallelism_plan, workload, mesh, assignment)
             sm = SubmeshMapping(model_mappings=[mm], submesh=mesh)
             ctx = self._workload_context(workload)
-            return sm.simulate_isolated(ctx, self.hardware, self._host_topo)
+            print(f"AutoMappingBridge.simulate_per_model: simulating model_id={model_id} with parallelism_plan={parallelism_plan}")
+            print(f"  model architecture: {mm.model.architecture}")
+            print(f"  model build pattern: {mm.model.build_pattern.__name__}")
+            print(f"  mesh: host_ids={mesh.host_ids} num_devices_per_host={mesh.num_devices_per_host}")
+            print(f"  workload context: ")
+            print(f"    workload_type={ctx.workload_type} batch_size={ctx.batch_size} microbatch_size={ctx.microbatch_size}")
+            print(f"    prompt_len={ctx.prompt_len} response_len={ctx.response_len} num_microbatches={ctx.num_microbatches}")
+            
+            cost = sm.simulate_isolated(ctx, self.hardware, self._host_topo)
+            print(f"Simulation result: cost={cost}")
+            return cost
         except ValueError:
             # Infeasible plan for this architecture / assignment shape — let
             # the auto_parallel search skip this candidate. Programming errors
             # (KeyError, TypeError, etc.) still propagate.
+            print(f"AutoMappingBridge.simulate_per_model: infeasible parallelism_plan={parallelism_plan} for model_id={model_id} with assignment={assignment}")
             return float("inf")
 
     def simulate_iteration(
