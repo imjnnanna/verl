@@ -134,7 +134,6 @@ class AutoMappingBridge:
         """
         if len(args) >= 4:
             assignment = kwargs.get("assignment")
-            print(f"AutoMappingBridge.simulate: dispatching to simulate_per_model with args={args[:4]} assignment={assignment}")
             return self.simulate_per_model(
                 args[0], args[1], args[2], args[3], assignment=assignment
             )
