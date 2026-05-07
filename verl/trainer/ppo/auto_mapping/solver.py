@@ -276,6 +276,10 @@ class Solver:
                     cost, gen_parallel = self.compute_cost(
                         g, l_cost, l_parallel=l_parallel, assignments=assignments
                     )
+                    print(
+                        f"[solve]       cost={cost:.6f} l_parallel={l_parallel} "
+                        f"gen_parallel={gen_parallel}"
+                    )
                     if cost < best_cost:
                         best_cost = cost
                         best_mapping = (g, submeshes, l_parallel)
@@ -296,6 +300,8 @@ class Solver:
                 f"(3) assign_machines_greedy rejected every submesh. "
                 f"See `[solve]` log lines above for which step failed."
             )
+
+        print(f"[solve] BEST cost={best_cost:.6f}")
 
         if self.topology is None or self.role_worker_mapping is None:
             return best_mapping

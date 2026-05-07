@@ -70,11 +70,24 @@ def export_solver_result(
 
 # config overrides for RayPPOTrainer
 def apply_parallelism_overrides(config, overrides: dict[Any, dict[str, int]]) -> None:
+    """Write the solver-chosen parallelism into the OmegaConf graph.
+
+    For ablation experiments that need to deploy a layout the solver did NOT
+    pick, set the env var `AUTO_MAPPING_SKIP_OVERRIDES` to a comma-separated
+    list of dotted paths. Those paths keep whatever value Hydra's CLI args
+    landed in the config — useful for forcing e.g. TP=1 in a split placement
+    when the solver wanted TP=2.
+    """
     if not overrides:
         return
+    import os
+    skip = {p for p in os.environ.get("AUTO_MAPPING_SKIP_OVERRIDES", "").split(",") if p}
     is_omega = OmegaConf.is_config(config)
     for _role, kvs in overrides.items():
         for path, value in kvs.items():
+            if path in skip:
+                print(f"[auto_mapping] skipping override of {path} (env AUTO_MAPPING_SKIP_OVERRIDES)")
+                continue
             if is_omega:
                 parent = path.rsplit(".", 1)[0]
                 if OmegaConf.select(config, parent, default=None) is None:
