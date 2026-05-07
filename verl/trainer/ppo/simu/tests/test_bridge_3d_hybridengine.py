@@ -240,12 +240,12 @@ def test_naive_p2p_picked_for_non_train_to_gen_transitions():
     assert isinstance(transitions[0].strategy, NaiveP2PStrategy)
 
 
-def test_simulate_iteration_includes_resharding_cost():
-    """End-to-end: total iter time with reshard > total iter time without.
-
-    Constructs the same compute graph twice (train+gen for the same actor),
-    once with identical parallelism (no reshard) and once with a real layout
-    swap. The latter must be strictly larger; the delta is the boundary cost.
+def test_train_to_gen_boundary_cost_is_positive_for_layout_swap():
+    """The TRAIN→GEN boundary's wall time must be > 0 when the layouts differ
+    (cross-host bytes flow). Pulls the boundary cost out of `boundary.simulate`
+    directly so changes in per-stage compute don't pollute the comparison —
+    different (p, t, d) layouts have different compute time, and the
+    iteration delta isn't a clean isolator of the resharding contribution.
     """
     bridge = _bridge(num_hosts=4)
     g = [(0,)]
@@ -256,41 +256,87 @@ def test_simulate_iteration_includes_resharding_cost():
         stage_workload_types=["training", "generation"],
     )
 
-    # No-reshard baseline: both stages use the SAME layout.
-    no_reshard_layouts = [{0: (1, 2, 2)}, {0: (1, 2, 2)}]
-    # Some unused arg permutation isn't valid here — for "no reshard" we need
-    # stage_layouts to declare gen layout == train layout, satisfying
-    # ZeroRedundancy's invariants (a=b=d_g=1, dest.dp == source.dp).
-    t_no_reshard = bridge.simulate_iteration(
+    # train (1, 2, 2) → gen (1, 1, 4): a=1, b=2, d_g=2. Each train shard sends
+    # to a unique gen rank; per-host placement under bridge._assign_shards
+    # spreads 4 ranks across 4 hosts → cross-host bytes flow.
+    layouts = [{0: (1, 2, 2)}, {0: (1, 1, 4)}]
+    timeline = bridge._build_timeline(
         g, l_parallel={0: (1, 2, 2)},
         workloads=workloads, assignments=assignments,
         dataflow_graph=dag,
-        stage_layouts=no_reshard_layouts,
+        stage_layouts=layouts,
         stage_workload_types=dag.stage_workload_types,
     )
+    assert len(timeline.boundaries) == 1
+    cost = timeline.boundaries[0].simulate(bridge.host_topo, bridge.hardware)
+    print(f"[bridge] train→gen boundary cost (layout swap) = {cost:.6f}s")
+    assert cost > 0, (
+        f"layout swap (1,2,2) → (1,1,4) should have positive boundary cost, got {cost}"
+    )
 
-    # Real reshard: train (1, 2, 2) → gen (1, 1, 4).
-    reshard_layouts = [{0: (1, 2, 2)}, {0: (1, 1, 4)}]
-    t_with_reshard = bridge.simulate_iteration(
+
+def test_no_transition_emitted_when_parallelism_and_workload_match():
+    """When src and dst share both parallelism and workload, the boundary
+    has zero transitions → boundary.simulate is exactly 0.0. (This case
+    rarely arises in dual-layout actors, since the workload differs by
+    construction; it's the legacy single-layout pass-through.)"""
+    bridge = _bridge(num_hosts=4)
+    g = [(0,)]
+    workloads = {0: _FakeWorkload(d_in=64, d_out=8, compute_type="training")}
+    assignments = [_assignment(4)]
+    dag = _FakeDag(
+        stages=[[0], [0]],
+        stage_workload_types=["training", "training"],
+    )
+    layouts = [{0: (1, 2, 2)}, {0: (1, 2, 2)}]
+    timeline = bridge._build_timeline(
         g, l_parallel={0: (1, 2, 2)},
         workloads=workloads, assignments=assignments,
         dataflow_graph=dag,
-        stage_layouts=reshard_layouts,
+        stage_layouts=layouts,
         stage_workload_types=dag.stage_workload_types,
     )
+    assert timeline.boundaries[0].transitions == []
+    assert timeline.boundaries[0].simulate(bridge.host_topo, bridge.hardware) == 0.0
 
-    print(
-        f"[bridge] no-reshard total = {t_no_reshard:.6f}s; "
-        f"with-reshard total = {t_with_reshard:.6f}s; "
-        f"delta = {t_with_reshard - t_no_reshard:.6f}s"
+
+def test_boundary_cost_grows_with_byte_volume():
+    """Sanity check: more bytes moved → boundary cost is at least as large.
+    Compares two reshards with different d_g (more d_g = more P2Ps + larger
+    AllGather rings)."""
+    bridge = _bridge(num_hosts=4)
+    g = [(0,)]
+    workloads = {0: _FakeWorkload(d_in=64, d_out=8, compute_type="training")}
+    assignments = [_assignment(4)]
+    dag = _FakeDag(
+        stages=[[0], [0]],
+        stage_workload_types=["training", "generation"],
     )
-    assert t_with_reshard > t_no_reshard, (
-        f"reshard cost should make iteration slower; got "
-        f"no_reshard={t_no_reshard}, with_reshard={t_with_reshard}"
+
+    # Both reshards source the same train (1, 2, 2). Vary how aggressively
+    # gen collapses TP into d_g.
+    # Case A: gen (1, 2, 2) → a=1, b=1, d_g=1 → no AllGather, intra-self P2Ps only.
+    # Case B: gen (1, 1, 4) → a=1, b=2, d_g=2 → real cross-host work.
+    timeline_a = bridge._build_timeline(
+        g, l_parallel={0: (1, 2, 2)},
+        workloads=workloads, assignments=assignments,
+        dataflow_graph=dag,
+        stage_layouts=[{0: (1, 2, 2)}, {0: (1, 2, 2)}],
+        stage_workload_types=dag.stage_workload_types,
     )
-    # The compute portion is identical between the two runs (same operator
-    # graphs, same hardware), so the entire delta is the boundary cost.
-    assert (t_with_reshard - t_no_reshard) > 0
+    timeline_b = bridge._build_timeline(
+        g, l_parallel={0: (1, 2, 2)},
+        workloads=workloads, assignments=assignments,
+        dataflow_graph=dag,
+        stage_layouts=[{0: (1, 2, 2)}, {0: (1, 1, 4)}],
+        stage_workload_types=dag.stage_workload_types,
+    )
+    cost_a = timeline_a.boundaries[0].simulate(bridge.host_topo, bridge.hardware)
+    cost_b = timeline_b.boundaries[0].simulate(bridge.host_topo, bridge.hardware)
+    print(f"[bridge] boundary cost: a=(d_g=1)={cost_a:.6f}s  b=(d_g=2)={cost_b:.6f}s")
+    assert cost_b > cost_a, (
+        f"larger d_g should have higher boundary cost; got a={cost_a}, b={cost_b}"
+    )
 
 
 def test_models_are_reused_across_stages_for_stage_transition_identity():
