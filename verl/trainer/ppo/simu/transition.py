@@ -5,7 +5,7 @@ from verl.trainer.ppo.simu.hardware import HardwareSpec
 from verl.trainer.ppo.simu.model_mapping import ModelMapping
 from verl.trainer.ppo.simu.network_op import NetworkOp
 from verl.trainer.ppo.simu.relation import NetworkPhase
-from verl.trainer.ppo.simu.resharding import NaiveP2PStrategy, ReshardingStrategy
+from verl.trainer.ppo.resharding import NaiveP2PStrategy, ReshardingStrategy
 from verl.trainer.ppo.simu.topo import HostTopo
 
 

@@ -20,7 +20,7 @@ from verl.trainer.ppo.simu.network_requirement import (
 from verl.trainer.ppo.simu.operators.llama_builder import build_llama_pattern
 from verl.trainer.ppo.simu.operators.llama_config import LlamaConfig
 from verl.trainer.ppo.simu.relation import NetworkPhase
-from verl.trainer.ppo.simu.resharding import (
+from verl.trainer.ppo.resharding import (
     NaiveP2PStrategy,
     llama_total_parameter_bytes,
 )

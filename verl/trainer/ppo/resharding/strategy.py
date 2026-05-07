@@ -1,4 +1,4 @@
-"""Inter-stage resharding strategies.
+"""Inter-stage resharding strategies — base interface + naive P2P.
 
 A ReshardingStrategy converts a (source_mapping, dest_mapping) pair into a
 list of NetworkOps that physically move parameter bytes from the source
@@ -7,9 +7,8 @@ parallelism layout to the destination layout.
 NaiveP2PStrategy is the v1 implementation: it walks Llama parameter
 tensors, computes per-tensor (src_host, dst_host) byte movements based on
 the natural Megatron sharding scheme, aggregates by host pair, and emits
-one P2P NetworkOp per pair. The interface is intentionally generic — a
-future HybridFlowMicroDPStrategy can return arbitrary NetworkOp subclasses
-(e.g., AllGather within micro-DP groups) without changing transition.py.
+one P2P NetworkOp per pair. The interface is intentionally generic — see
+`zero_redundancy.py` for HybridFlow's micro-DP zero-redundancy variant.
 """
 
 from __future__ import annotations
