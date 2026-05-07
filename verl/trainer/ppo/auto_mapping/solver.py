@@ -10,6 +10,7 @@ from .auto_parallel import auto_parallel
 from .mem_model import get_min_alloc
 from .assignment import assign_machines_greedy
 from .ray_config import export_solver_result
+from . import simulators
 import numpy as np
 
 @dataclass
@@ -49,7 +50,7 @@ class DataflowGraph:
         return self.stages[stage_idx]
     
 class Solver:
-    def __init__(self, D, L, W, N, M, Q, topology=None, role_worker_mapping=None, model_specs=None):
+    def __init__(self, D, L, W, N, M, Q, topology=None, role_worker_mapping=None, model_specs=None, bridge=None):
         self.D = D # DataflowGraph - dataflow graph of the RLHF pipeline
         self.L = L # list[Role] - Roles in RLHF dataflow
         self.W = W # dict[int, Workload] - workload of roles in RLHF dataflow
@@ -59,9 +60,25 @@ class Solver:
         self.topology = topology # topology - physical bandwidth tiers; for ray_config export
         self.role_worker_mapping = role_worker_mapping # dict[Role, WorkerType] - solver-id i in list(role_worker_mapping)[i]
         self.model_specs = model_specs # dict[role_id, ModelSpec] - architecture+workload info for memory accounting
-    
-    def compute_cost(self, g, l_cost):
-        s = self.D.num_stages 
+        # Optional simu.bridge.AutoMappingBridge. When set, auto_parallel's
+        # per-model `simulate(...)` routes to bridge.simulate_per_model, and
+        # compute_cost dispatches to bridge.simulate_iteration for the
+        # full-timeline cost.
+        self.bridge = bridge
+
+    def compute_cost(self, g, l_cost, l_parallel=None, assignments=None):
+        # Bridge path: full RLHF iteration cost via simulate_rlhf_iteration.
+        # Needs l_parallel and assignments because the bridge re-builds the
+        # operator graph for each (g, submeshes) candidate; per-model l_cost
+        # alone isn't enough.
+        if self.bridge is not None and l_parallel is not None and assignments is not None:
+            return self.bridge.simulate_iteration(
+                g, l_parallel, self.W, assignments, dataflow_graph=self.D
+            )
+
+        # Aggregator over precomputed per-model l_cost (legacy path; also the
+        # fallback when bridge isn't fully wired).
+        s = self.D.num_stages
         c = [0] * s # computation cost per stage
 
         for group in g:
@@ -70,7 +87,7 @@ class Solver:
                 for l in group:
                     if l in self.D.roles_in_stage(i):
                         c_g[i] += l_cost[l]
-            c[i] = max(c[i], c_g[i])
+                c[i] = max(c[i], c_g[i])
         return sum(c)
 
     def solve(self) -> tuple[dict, dict, dict]:
@@ -82,43 +99,68 @@ class Solver:
         best_assignments = None
 
         submesh_cache = {}   # min_area -> list of submesh configs from enum_submesh_shapes
-        ap_cache = {}        # (l, min_area, h, w) -> (cost, parallel) from auto_parallel
+        # ap_cache key includes the assignment's host signature when the bridge
+        # is active — different physical assignments span different bandwidth
+        # tiers and produce different per-model costs even for identical
+        # (l, min_area, h, w).
+        ap_cache = {}        # (l, min_area, h, w, assignment_sig) -> (cost, parallel)
 
-        for g in G:
-            A_min = get_min_alloc(g, self.Q, self.N * self.M, self.model_specs)
-            min_area = tuple(A_min[i].n for i in range(len(g)))
+        # Register the bridge for the duration of solve(); auto_parallel.simulate
+        # consults it via simulators.simulate's module-level dispatcher.
+        prev_bridge = simulators.get_bridge()
+        if self.bridge is not None:
+            simulators.set_bridge(self.bridge)
+        try:
+            for g in G:
+                A_min = get_min_alloc(g, self.Q, self.N * self.M, self.model_specs)
+                min_area = tuple(A_min[i].n for i in range(len(g)))
 
-            if min_area not in submesh_cache:
-                submesh_cache[min_area] = enum_submesh_shapes(self.N, self.M, list(min_area))
+                if min_area not in submesh_cache:
+                    submesh_cache[min_area] = enum_submesh_shapes(self.N, self.M, list(min_area))
 
-            n_submeshes = len(submesh_cache[min_area])
-            print(f"[solve]   g={g} min_area={min_area} -> {n_submeshes} submesh options")
+                n_submeshes = len(submesh_cache[min_area])
+                print(f"[solve]   g={g} min_area={min_area} -> {n_submeshes} submesh options")
 
-            for submeshes in submesh_cache[min_area]:
-                assignments = None
-                if self.topology is not None:
-                    # skip non-packing submeshes
-                    assignments = assign_machines_greedy(list(submeshes), self.topology)
-                    if assignments is None:
-                        print(f"[solve]     submeshes={submeshes} -> assignment FAILED")
-                        continue
-                    print(f"[solve]     submeshes={submeshes} -> assigned")
-                l_parallel = {}
-                l_cost = {}
-                for i, group in enumerate(g):
-                    h, w = submeshes[i]
-                    id_mesh = np.arange(h * w).reshape((h, w))
-                    device_mesh = DeviceMesh(id_mesh=id_mesh)
-                    for l in group:
-                        key = (l, min_area, h, w)
-                        if key not in ap_cache:
-                            ap_cache[key] = auto_parallel(l, A_min[i], self.W[l], device_mesh)
-                        l_cost[l], l_parallel[l] = ap_cache[key]
-                cost = self.compute_cost(g, l_cost)
-                if cost < best_cost:
-                    best_cost = cost
-                    best_mapping = (g, submeshes, l_parallel)
-                    best_assignments = assignments
+                for submeshes in submesh_cache[min_area]:
+                    assignments = None
+                    if self.topology is not None:
+                        # skip non-packing submeshes
+                        assignments = assign_machines_greedy(list(submeshes), self.topology)
+                        if assignments is None:
+                            print(f"[solve]     submeshes={submeshes} -> assignment FAILED")
+                            continue
+                        print(f"[solve]     submeshes={submeshes} -> assigned")
+                    l_parallel = {}
+                    l_cost = {}
+                    for i, group in enumerate(g):
+                        h, w = submeshes[i]
+                        id_mesh = np.arange(h * w).reshape((h, w))
+                        device_mesh = DeviceMesh(id_mesh=id_mesh)
+                        assignment_for_group = assignments[i] if assignments is not None else None
+                        assignment_sig = (
+                            tuple(assignment_for_group.host_ids)
+                            if (self.bridge is not None and assignment_for_group is not None)
+                            else None
+                        )
+                        for l in group:
+                            key = (l, min_area, h, w, assignment_sig)
+                            if key not in ap_cache:
+                                ap_cache[key] = auto_parallel(
+                                    l, A_min[i], self.W[l], device_mesh,
+                                    assignment=assignment_for_group,
+                                )
+                            l_cost[l], l_parallel[l] = ap_cache[key]
+                    cost = self.compute_cost(
+                        g, l_cost, l_parallel=l_parallel, assignments=assignments
+                    )
+                    if cost < best_cost:
+                        best_cost = cost
+                        best_mapping = (g, submeshes, l_parallel)
+                        best_assignments = assignments
+        finally:
+            # Restore prior bridge state so concurrent or nested solves don't
+            # leak this Solver's bridge into other call sites.
+            simulators.set_bridge(prev_bridge)
         
         if best_mapping is None:
             raise RuntimeError(

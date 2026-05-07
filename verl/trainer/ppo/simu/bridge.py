@@ -32,6 +32,8 @@ from verl.trainer.ppo.simu.mesh import Mesh
 from verl.trainer.ppo.simu.model import ArchitectureConfig, BuildPatternFn, Model
 from verl.trainer.ppo.simu.model_mapping import ModelMapping
 from verl.trainer.ppo.simu.network_requirement import ParallelismConfig
+from verl.trainer.ppo.simu.operators.llama_builder import build_llama_pattern
+from verl.trainer.ppo.simu.operators.llama_config import LlamaConfig
 from verl.trainer.ppo.simu.shard import Shard
 from verl.trainer.ppo.simu.simulator import simulate_rlhf_iteration
 from verl.trainer.ppo.simu.stages import RLHFTimeline, StageBoundary
@@ -41,7 +43,7 @@ from verl.trainer.ppo.simu.workload_context import Workload, WorkloadContext
 
 if TYPE_CHECKING:
     from verl.trainer.ppo.auto_mapping.assignment import GroupAssignment
-    from verl.trainer.ppo.auto_mapping.solver import Workload as AutoWorkload
+    from verl.trainer.ppo.auto_mapping.solver import DataflowGraph, Workload as AutoWorkload
     from verl.utils.topology import Topology
 
 
@@ -53,6 +55,36 @@ _AUTO_TO_SIMU_WORKLOAD: dict[str, Workload] = {
     "inference": Workload.PREPARATION,
     "training": Workload.TRAINING,
 }
+
+
+# TODO(architecture-resolution): Hardwired Qwen2.5-0.5B-Instruct as the bridge's
+# default model architecture. auto_mapping's `Workload` doesn't carry enough
+# info to identify the actual model (only d_in/d_out/compute_type), so the
+# bridge falls back to this when callers don't supply per-role architectures.
+# Switch to one of:
+#   (a) Resolve architecture from auto_mapping's `model_specs` channel once
+#       its shape stabilizes (currently a stub in mem_model.py).
+#   (b) Have the Solver caller (main_ppo.py) read each role's HF model path
+#       from config and construct the per-role ArchitectureConfig externally,
+#       passing model_architectures / model_build_patterns explicitly.
+# Either path drops this hardwire — every caller-supplied architecture takes
+# precedence over the fallback.
+_QWEN2_5_0_5B_INSTRUCT = LlamaConfig(
+    h=896,           # hidden_size
+    n_layers=24,     # num_hidden_layers
+    n_q=14,          # num_attention_heads
+    n_kv=2,          # num_key_value_heads (GQA)
+    head_size=64,    # = hidden_size // num_attention_heads
+    m=4864,          # intermediate_size
+    rope_dim=64,     # = head_size for Qwen2.5
+    vocab=151_936,   # vocab_size
+    flash_block_size=64,
+    dtype_bytes=2,   # BF16
+)
+_QWEN_BUILD_PATTERN = build_llama_pattern  # Qwen2.5 = Llama-arch-compatible
+                                            # (GQA + SwiGLU + RoPE + RMSNorm).
+                                            # Bias on QKV and tied embeddings are
+                                            # negligible for analytical timing.
 
 
 class AutoMappingBridge:
@@ -69,17 +101,21 @@ class AutoMappingBridge:
         self,
         topology: "Topology",
         hardware: HardwareSpec,
-        model_architectures: dict[Any, ArchitectureConfig],
-        model_build_patterns: dict[Any, BuildPatternFn],
+        model_architectures: Optional[dict[Any, ArchitectureConfig]] = None,
+        model_build_patterns: Optional[dict[Any, BuildPatternFn]] = None,
         link_latency_ms: float = 0.1,
         intra_host_latency_ms: float = 0.0,
         default_microbatch_size: int = 1,
         default_num_microbatches: int = 1,
     ) -> None:
+        # `model_architectures` / `model_build_patterns` are optional. Roles
+        # without an entry fall back to the Qwen2.5-0.5B hardwire defined at
+        # module scope (see _QWEN2_5_0_5B_INSTRUCT TODO). Callers that
+        # supply these dicts override the hardwire on a per-role basis.
         self.topology = topology
         self.hardware = hardware
-        self._archs = dict(model_architectures)
-        self._build_patterns = dict(model_build_patterns)
+        self._archs = dict(model_architectures or {})
+        self._build_patterns = dict(model_build_patterns or {})
         self._link_latency_ms = link_latency_ms
         self._intra_host_latency_ms = intra_host_latency_ms
         self._default_microbatch_size = default_microbatch_size
@@ -92,14 +128,18 @@ class AutoMappingBridge:
     def simulate(self, *args, **kwargs) -> float:
         """Variadic dispatcher for the auto_mapping `simulate(...)` callsite.
 
-        auto_parallel.simulate(parallelism, l, W, device_mesh) — 4 args →
-        routes to simulate_per_model. Other call shapes raise.
+        Accepts `simulate(parallelism, l, W, device_mesh, assignment=...)`
+        — 4 positional args + optional `assignment` kwarg. Routes to
+        simulate_per_model. Other call shapes raise.
         """
         if len(args) >= 4:
-            return self.simulate_per_model(args[0], args[1], args[2], args[3])
+            assignment = kwargs.get("assignment")
+            return self.simulate_per_model(
+                args[0], args[1], args[2], args[3], assignment=assignment
+            )
         raise TypeError(
             "AutoMappingBridge.simulate received unexpected args; expected "
-            "(parallelism, model_id, workload, device_mesh)."
+            "(parallelism, model_id, workload, device_mesh, [assignment=...])."
         )
 
     def simulate_per_model(
@@ -108,26 +148,41 @@ class AutoMappingBridge:
         model_id: Any,
         workload: "AutoWorkload",
         device_mesh: Any,
+        assignment: Optional["GroupAssignment"] = None,
     ) -> float:
         """Build a one-model `SubmeshMapping` and run `simulate_isolated`.
 
-        Requires the device_mesh to carry an `assignment` attribute (a
-        `GroupAssignment`). Solver attaches this when constructing the
-        `LogicalDeviceMesh`.
+        Requires a `GroupAssignment`: pass it explicitly via the `assignment`
+        kwarg (preferred — Solver threads it through `auto_parallel`'s call),
+        or attach it to `device_mesh.assignment` for bridge-aware DeviceMesh
+        subclasses (legacy path).
+
+        Returns `float("inf")` when the parallelism is infeasible for the
+        chosen architecture (e.g. TP=4 against Qwen's `n_kv=2`, or a shard
+        count that exceeds the assignment's device count). auto_parallel
+        iterates over many candidates and treats inf as "skip", so this lets
+        the search proceed without aborting on the first invalid shape.
         """
-        assignment = getattr(device_mesh, "assignment", None)
+        if assignment is None:
+            assignment = getattr(device_mesh, "assignment", None)
         if assignment is None:
             raise RuntimeError(
-                "AutoMappingBridge.simulate_per_model: device_mesh has no "
-                "`assignment` attribute. Solver must construct LogicalDeviceMesh "
-                "with the matching GroupAssignment so the bridge can place "
-                "shards on physical hosts."
+                "AutoMappingBridge.simulate_per_model: no GroupAssignment. "
+                "Either pass `assignment=...` from the caller (Solver routes "
+                "it through auto_parallel) or attach it to "
+                "`device_mesh.assignment`."
             )
-        mesh = self._mesh_for_assignment(assignment)
-        mm = self._model_mapping(model_id, parallelism_plan, workload, mesh, assignment)
-        sm = SubmeshMapping(model_mappings=[mm], submesh=mesh)
-        ctx = self._workload_context(workload)
-        return sm.simulate_isolated(ctx, self.hardware, self._host_topo)
+        try:
+            mesh = self._mesh_for_assignment(assignment)
+            mm = self._model_mapping(model_id, parallelism_plan, workload, mesh, assignment)
+            sm = SubmeshMapping(model_mappings=[mm], submesh=mesh)
+            ctx = self._workload_context(workload)
+            return sm.simulate_isolated(ctx, self.hardware, self._host_topo)
+        except ValueError:
+            # Infeasible plan for this architecture / assignment shape — let
+            # the auto_parallel search skip this candidate. Programming errors
+            # (KeyError, TypeError, etc.) still propagate.
+            return float("inf")
 
     def simulate_iteration(
         self,
@@ -135,13 +190,21 @@ class AutoMappingBridge:
         l_parallel: dict[Any, Any],
         workloads: dict[Any, "AutoWorkload"],
         assignments: list["GroupAssignment"],
+        dataflow_graph: Optional["DataflowGraph"] = None,
     ) -> float:
         """Build a full `RLHFTimeline` and run `simulate_rlhf_iteration`.
 
-        Returns total iteration wall time. Boundaries (resharding) are not
-        modeled — auto_mapping doesn't currently provide that information.
+        When `dataflow_graph` is supplied, stage construction uses
+        `dataflow_graph.roles_in_stage(i)` directly — preferred path because
+        it lets the same model appear in multiple stages and respects the
+        caller's stage ordering. Without a dataflow_graph, falls back to
+        grouping by `Workload.compute_type` against a hardcoded RLHF stage
+        order.
+
+        Boundaries (resharding) are not modeled — auto_mapping doesn't
+        currently provide that information.
         """
-        timeline = self._build_timeline(g, l_parallel, workloads, assignments)
+        timeline = self._build_timeline(g, l_parallel, workloads, assignments, dataflow_graph)
         ctx = self._reference_workload_context(workloads)
         result = simulate_rlhf_iteration(timeline, ctx, self.hardware, self._host_topo)
         return result.total_time
@@ -213,14 +276,12 @@ class AutoMappingBridge:
                 f"expected one of {list(_AUTO_TO_SIMU_WORKLOAD)}"
             )
 
-        arch = self._archs.get(model_id)
-        build_pattern = self._build_patterns.get(model_id)
-        if arch is None or build_pattern is None:
-            raise KeyError(
-                f"AutoMappingBridge: no architecture/build_pattern for model "
-                f"{model_id!r}. Pass them via the model_architectures / "
-                f"model_build_patterns args at bridge construction."
-            )
+        # TODO(architecture-resolution): Roles without an explicit entry fall
+        # back to the Qwen2.5-0.5B-Instruct hardwire. Replace with proper
+        # architecture resolution from `model_specs` (or caller-side wiring)
+        # before treating the bridge as production-ready for non-Qwen runs.
+        arch = self._archs.get(model_id, _QWEN2_5_0_5B_INSTRUCT)
+        build_pattern = self._build_patterns.get(model_id, _QWEN_BUILD_PATTERN)
 
         model = Model(
             name=f"auto_{model_id}",
@@ -334,20 +395,41 @@ class AutoMappingBridge:
         l_parallel: dict[Any, Any],
         workloads: dict[Any, "AutoWorkload"],
         assignments: list["GroupAssignment"],
+        dataflow_graph: Optional["DataflowGraph"] = None,
     ) -> RLHFTimeline:
-        """One SubmeshMapping per (group × stage_type) cell with non-empty members.
+        """Build the RLHFTimeline for one (g, l_parallel, assignments) plan.
 
-        A given group's submesh appears in every stage that has at least one
-        of its models. Stages run sequentially (the simulator sums them);
-        within a stage, multiple submeshes run in parallel and contend on
-        the shared fabric.
+        With `dataflow_graph`: stage construction uses `dag.roles_in_stage(i)`
+        — a model can appear in multiple stages, stage ordering is the dag's,
+        and `compute_type` only feeds the per-MM `Workload` enum (not stage
+        placement).
+
+        Without `dataflow_graph`: falls back to grouping by `compute_type`
+        against `_STAGE_ORDER`, the legacy behavior.
         """
         if len(assignments) != len(g):
             raise ValueError(
                 f"len(assignments)={len(assignments)} ≠ len(g)={len(g)}; "
                 "every placement group must have a corresponding GroupAssignment."
             )
+        if dataflow_graph is not None:
+            return self._build_timeline_from_dag(
+                g, l_parallel, workloads, assignments, dataflow_graph
+            )
+        return self._build_timeline_by_compute_type(
+            g, l_parallel, workloads, assignments
+        )
 
+    def _build_timeline_by_compute_type(
+        self,
+        g: list[tuple[int, ...]],
+        l_parallel: dict[Any, Any],
+        workloads: dict[Any, "AutoWorkload"],
+        assignments: list["GroupAssignment"],
+    ) -> RLHFTimeline:
+        """Legacy timeline construction: group by `Workload.compute_type` against
+        `_STAGE_ORDER`. One stage per compute_type that has at least one model.
+        """
         group_meshes: dict[int, Mesh] = {}
         cell_mappings: dict[tuple[int, str], list[ModelMapping]] = {}
 
@@ -380,7 +462,57 @@ class AutoMappingBridge:
             if stage_submeshes:
                 stages.append(stage_submeshes)
 
-        # No resharding modeled: empty StageBoundary between consecutive stages.
+        boundaries = [StageBoundary(transitions=[]) for _ in range(max(0, len(stages) - 1))]
+        return RLHFTimeline(stages=stages, boundaries=boundaries)
+
+    def _build_timeline_from_dag(
+        self,
+        g: list[tuple[int, ...]],
+        l_parallel: dict[Any, Any],
+        workloads: dict[Any, "AutoWorkload"],
+        assignments: list["GroupAssignment"],
+        dag: "DataflowGraph",
+    ) -> RLHFTimeline:
+        """Use the explicit dag.stages structure for stage placement.
+
+        Each ModelMapping is built once per (group, model) pair, then placed
+        into every stage `i` with `model_id in dag.roles_in_stage(i)`. A
+        model that appears in multiple stages contributes its kernel time
+        independently in each — accurate for actor-style models that both
+        roll out and train within one iteration.
+        """
+        group_meshes: dict[int, Mesh] = {}
+        # (group_idx, model_id) -> ModelMapping (built once, reused across stages)
+        model_mappings: dict[tuple[int, Any], ModelMapping] = {}
+
+        for group_idx, group in enumerate(g):
+            assignment = assignments[group_idx]
+            mesh = self._mesh_for_assignment(assignment)
+            group_meshes[group_idx] = mesh
+            for model_id in group:
+                workload = workloads[model_id]
+                ptd = _unpack_parallelism(l_parallel[model_id])
+                mm = self._model_mapping(model_id, ptd, workload, mesh, assignment)
+                model_mappings[(group_idx, model_id)] = mm
+
+        stages: list[list[SubmeshMapping]] = []
+        for stage_idx in range(dag.num_stages):
+            roles_in_this_stage = set(dag.roles_in_stage(stage_idx))
+            stage_submeshes: list[SubmeshMapping] = []
+            for group_idx, group in enumerate(g):
+                mms = [
+                    model_mappings[(group_idx, mid)]
+                    for mid in group
+                    if mid in roles_in_this_stage
+                ]
+                if not mms:
+                    continue
+                stage_submeshes.append(
+                    SubmeshMapping(model_mappings=mms, submesh=group_meshes[group_idx])
+                )
+            if stage_submeshes:
+                stages.append(stage_submeshes)
+
         boundaries = [StageBoundary(transitions=[]) for _ in range(max(0, len(stages) - 1))]
         return RLHFTimeline(stages=stages, boundaries=boundaries)
 

@@ -34,8 +34,24 @@ from verl.utils.import_utils import load_extern_object
 from verl.trainer.ppo.auto_mapping.ray_config import get_topology
 from verl.trainer.ppo.auto_mapping.solver import Solver, Workload, DataflowGraph
 from verl.trainer.ppo.auto_mapping.mem_model import ModelSpec
+from verl.trainer.ppo.simu.bridge import AutoMappingBridge
+from verl.trainer.ppo.simu.hardware import HardwareSpec
 from verl.trainer.ppo.ray_trainer import ResourcePoolManager
 from verl.trainer.ppo.ray_trainer import Role
+
+
+# H200 SXM 141GB hardware spec for the auto-mapping bridge.
+# - BF16/FP16 dense peak: 989 TFLOPS (no sparsity).
+# - HBM3e bandwidth: ~4.8 TB/s.
+# - Roofline ridge: 989e12 / 4.8e12 ≈ 206 FLOPs/byte.
+# TODO: surface as `trainer.auto_mapping.hardware` config when other GPU
+# targets become relevant; right now the only call site is the auto-mapping
+# Solver and we hardware to H200.
+_H200_HARDWARE = HardwareSpec(
+    peak_compute_flops=989e12,
+    peak_memory_bandwidth=4.8e12,
+    ridge_flops_per_byte=206.0,
+)
 
 
 @hydra.main(config_path="config", config_name="ppo_trainer", version_base=None)
@@ -292,12 +308,24 @@ class TaskRunner:
 
         model_specs = self._build_model_specs(config, roles, prompt_len, response_len)
 
+        # Wire the simu bridge so auto_parallel.simulate routes to the actual
+        # roofline simulator instead of the legacy `t*p + 1/d` stub. The
+        # bridge falls back to a hardwired Qwen2.5-0.5B-Instruct architecture
+        # when callers don't supply per-role architectures — see the
+        # _QWEN2_5_0_5B_INSTRUCT TODO in simu/bridge.py.
+        # TODO(architecture-resolution): once architecture can be derived from
+        # `model_specs` (or another caller-side channel), populate
+        # `model_architectures` / `model_build_patterns` here so non-Qwen
+        # roles aren't silently treated as Qwen.
+        bridge = AutoMappingBridge(topology=topology, hardware=_H200_HARDWARE)
+
         solver = Solver(
             D=D, L=L, W=W,
             N=topology.num_hosts(), M=topology.gpus_per_host(), Q=Q,
             topology=topology,
             role_worker_mapping=self.role_worker_mapping,
             model_specs=model_specs,
+            bridge=bridge,
         )
         resource_pool_spec, mapping, overrides = solver.solve()
 

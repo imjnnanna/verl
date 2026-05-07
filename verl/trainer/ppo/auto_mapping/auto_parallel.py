@@ -2,8 +2,11 @@ from __future__ import annotations
 from .simulators import simulate
 
 
-def auto_parallel(l: int, A_min, W, device_mesh) -> tuple[float, tuple[int, int, int]]:
+def auto_parallel(l: int, A_min, W, device_mesh, assignment=None) -> tuple[float, tuple[int, int, int]]:
 	# return cost and (PP, DP, TP) for model l
+	# `assignment` is an optional GroupAssignment forwarded to simulate(). The
+	# simu bridge needs it to place ranks on physical hosts; the legacy stub
+	# ignores it.
 	num_hosts = device_mesh.id_mesh.shape[0]
 	num_devices_per_host = device_mesh.id_mesh.shape[1]
 	num_devices = num_hosts * num_devices_per_host
@@ -18,7 +21,7 @@ def auto_parallel(l: int, A_min, W, device_mesh) -> tuple[float, tuple[int, int,
 			if d < 1:
 				continue
 			parallelism_plan = (p, t, d)
-			cost = simulate(parallelism_plan, l, W, device_mesh)
+			cost = simulate(parallelism_plan, l, W, device_mesh, assignment=assignment)
 			if cost < best_cost:
 				best_cost = cost
 				best_parallelism = parallelism_plan

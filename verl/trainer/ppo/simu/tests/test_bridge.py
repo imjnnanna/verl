@@ -86,6 +86,19 @@ class _AutoWorkload:
     compute_type: str
 
 
+@dataclass
+class _DataflowGraph:
+    """Duck-types auto_mapping.solver.DataflowGraph (only the read API the bridge uses)."""
+    stages: list[list[int]]
+
+    @property
+    def num_stages(self) -> int:
+        return len(self.stages)
+
+    def roles_in_stage(self, stage_idx: int) -> list[int]:
+        return self.stages[stage_idx]
+
+
 # ---- shared fixtures ---------------------------------------------------------
 
 
@@ -313,10 +326,47 @@ def test_unknown_compute_type_raises():
         bridge.simulate_iteration([(0,)], {0: (1, 4, 1)}, workloads, [assignment])
 
 
-def test_missing_architecture_raises_clear_error():
+def test_missing_architecture_falls_back_to_qwen_hardwire():
+    """Roles without an explicit architecture fall back to the hardwired
+    Qwen2.5-0.5B-Instruct config (TODO in bridge.py). Pre-hardwire the bridge
+    raised; this test pins the new behavior so the hardwire's removal is
+    deliberate when it lands.
+    """
     topo = _two_block_topology()
-    # Bridge constructed with NO architecture for model 99.
-    bridge = _make_bridge(topo, model_ids=[0])
+    # Bridge constructed with NO architecture for model 99 (and an empty
+    # model_architectures dict to confirm the hardwire fires even when
+    # nothing is supplied).
+    bridge = AutoMappingBridge(
+        topology=topo,
+        hardware=A100,
+        # model_architectures / model_build_patterns intentionally omitted
+        # to exercise the Qwen hardwire end-to-end.
+    )
+    assignment = _GroupAssignment(
+        group_index=0, submesh_shape=(1, 2),
+        host_ids=["host_0_0"], gpus_per_host=[2],
+        block_ids=["block_0"],
+    )
+    w = _AutoWorkload(d_in=64, d_out=0, compute_type="training")
+    device_mesh = SimpleNamespace(assignment=assignment)
+
+    # Qwen2.5-0.5B has n_q=14, n_kv=2 — so the only valid TP degrees are 1 and 2
+    # (the only divisors of 2 that also divide 14). Use TP=2, PP=1, DP=1.
+    t = bridge.simulate_per_model((1, 2, 1), 99, w, device_mesh)
+    assert t > 0.0
+
+
+def test_bridge_returns_inf_on_infeasible_parallelism():
+    """auto_parallel iterates many TP/PP combos; some violate architecture
+    divisibility constraints (e.g. Qwen2.5-0.5B has n_kv=2, so TP=4 fails the
+    `n_kv % tp == 0` check inside build_llama_layer). The bridge swallows
+    the resulting ValueError and returns inf so the search can skip the
+    infeasible point and keep going.
+    """
+    topo = _two_block_topology(hosts_per_block=2, gpus_per_host=4)
+    # Default Qwen hardwire (no model_architectures supplied).
+    bridge = AutoMappingBridge(topology=topo, hardware=A100)
+
     assignment = _GroupAssignment(
         group_index=0, submesh_shape=(1, 4),
         host_ids=["host_0_0"], gpus_per_host=[4],
@@ -325,8 +375,40 @@ def test_missing_architecture_raises_clear_error():
     w = _AutoWorkload(d_in=64, d_out=0, compute_type="training")
     device_mesh = SimpleNamespace(assignment=assignment)
 
-    with pytest.raises(KeyError, match="no architecture/build_pattern for model"):
-        bridge.simulate_per_model((1, 4, 1), 99, w, device_mesh)
+    # Qwen2.5-0.5B has n_kv=2 → TP=4 is infeasible.
+    cost = bridge.simulate_per_model((1, 4, 1), 0, w, device_mesh)
+    assert cost == float("inf"), f"expected inf for infeasible TP=4, got {cost}"
+
+    # The variadic dispatcher (the actual auto_parallel call path) must also
+    # surface inf, not raise.
+    cost_via_dispatch = bridge.simulate(
+        (1, 4, 1), 0, w, device_mesh, assignment=assignment
+    )
+    assert cost_via_dispatch == float("inf")
+
+    # A feasible TP=2 still produces a finite cost — the inf path is
+    # narrowly scoped to the actually-infeasible combos.
+    cost_ok = bridge.simulate_per_model((1, 2, 1), 0, w, device_mesh)
+    assert 0.0 < cost_ok < float("inf")
+
+
+def test_explicit_architecture_overrides_qwen_hardwire():
+    """Caller-supplied model_architectures takes precedence over the hardwire."""
+    topo = _two_block_topology()
+    bridge = _make_bridge(topo, model_ids=[42])  # SMALL_LLAMA for model 42
+
+    assignment = _GroupAssignment(
+        group_index=0, submesh_shape=(1, 4),
+        host_ids=["host_0_0"], gpus_per_host=[4],
+        block_ids=["block_0"],
+    )
+    w = _AutoWorkload(d_in=64, d_out=0, compute_type="training")
+    device_mesh = SimpleNamespace(assignment=assignment)
+
+    # If the hardwire were taking precedence, TP=4 would fail Qwen's
+    # n_kv=2 divisibility check. SMALL_LLAMA has n_kv=4, so TP=4 succeeds.
+    t = bridge.simulate_per_model((1, 4, 1), 42, w, device_mesh)
+    assert t > 0.0
 
 
 def test_missing_assignment_on_device_mesh_raises():
@@ -336,5 +418,107 @@ def test_missing_assignment_on_device_mesh_raises():
 
     device_mesh_no_assignment = SimpleNamespace()  # no assignment attribute
 
-    with pytest.raises(RuntimeError, match="no `assignment` attribute"):
+    with pytest.raises(RuntimeError, match="no GroupAssignment"):
         bridge.simulate_per_model((1, 4, 1), 0, w, device_mesh_no_assignment)
+
+
+def test_simulate_per_model_explicit_assignment_kwarg():
+    """The new preferred call form: pass assignment explicitly, bypass
+    device_mesh.assignment entirely. This is what auto_parallel does after
+    the integration."""
+    topo = _two_block_topology(hosts_per_block=2, gpus_per_host=4)
+    bridge = _make_bridge(topo, model_ids=[0])
+
+    assignment = _GroupAssignment(
+        group_index=0, submesh_shape=(1, 4),
+        host_ids=["host_0_0"], gpus_per_host=[4],
+        block_ids=["block_0"],
+    )
+    bare_device_mesh = SimpleNamespace()  # no assignment attribute
+    w = _AutoWorkload(d_in=64, d_out=0, compute_type="training")
+
+    t = bridge.simulate_per_model((1, 4, 1), 0, w, bare_device_mesh, assignment=assignment)
+    assert t > 0.0
+
+
+def test_dispatcher_routes_simulate_kwargs_to_simulate_per_model():
+    """`bridge.simulate(parallelism, l, W, device_mesh, assignment=...)` is the
+    shape `simulators.simulate(...)` forwards from auto_parallel. Verify the
+    kwarg is honored end-to-end."""
+    topo = _two_block_topology()
+    bridge = _make_bridge(topo, model_ids=[0])
+
+    assignment = _GroupAssignment(
+        group_index=0, submesh_shape=(1, 4),
+        host_ids=["host_0_0"], gpus_per_host=[4],
+        block_ids=["block_0"],
+    )
+    bare_device_mesh = SimpleNamespace()
+    w = _AutoWorkload(d_in=64, d_out=0, compute_type="training")
+
+    t = bridge.simulate((1, 4, 1), 0, w, bare_device_mesh, assignment=assignment)
+    assert t > 0.0
+
+
+def test_simulate_iteration_with_dataflow_graph_uses_dag_stages():
+    """When a DataflowGraph is passed, stage construction follows
+    `dag.stages` rather than the compute_type-string fallback. A model in two
+    stages (e.g. an actor that rolls out and trains) should appear in both."""
+    topo = _two_block_topology()
+    bridge = _make_bridge(topo, model_ids=[0, 1])
+
+    assignments = [
+        _GroupAssignment(
+            group_index=0, submesh_shape=(1, 4),
+            host_ids=["host_0_0"], gpus_per_host=[4],
+            block_ids=["block_0"],
+        ),
+        _GroupAssignment(
+            group_index=1, submesh_shape=(1, 4),
+            host_ids=["host_0_1"], gpus_per_host=[4],
+            block_ids=["block_0"],
+        ),
+    ]
+    g = [(0,), (1,)]
+    workloads = {
+        0: _AutoWorkload(d_in=64, d_out=8, compute_type="generation"),
+        1: _AutoWorkload(d_in=64, d_out=0, compute_type="training"),
+    }
+    l_parallel = {0: (1, 4, 1), 1: (1, 4, 1)}
+    # Three stages: rollout (model 0), preparation (BOTH), training (model 1).
+    # Model 0 contributes in stage 0 and stage 1; model 1 contributes in
+    # stage 1 and stage 2. The compute_type fallback can't express this.
+    dag = _DataflowGraph(stages=[[0], [0, 1], [1]])
+
+    timeline = bridge._build_timeline(g, l_parallel, workloads, assignments, dataflow_graph=dag)
+    assert len(timeline.stages) == 3
+
+    # Stage 0: only model 0's submesh
+    assert len(timeline.stages[0]) == 1
+    assert len(timeline.stages[0][0].model_mappings) == 1
+    # Stage 1: both submeshes (one for each group with a model in this stage)
+    assert len(timeline.stages[1]) == 2
+    # Stage 2: only model 1's submesh
+    assert len(timeline.stages[2]) == 1
+    assert len(timeline.stages[2][0].model_mappings) == 1
+
+
+def test_simulate_iteration_with_dag_returns_positive_total():
+    """End-to-end with DataflowGraph: bridge.simulate_iteration should run."""
+    topo = _two_block_topology()
+    bridge = _make_bridge(topo, model_ids=[0])
+
+    assignments = [
+        _GroupAssignment(
+            group_index=0, submesh_shape=(1, 4),
+            host_ids=["host_0_0"], gpus_per_host=[4],
+            block_ids=["block_0"],
+        ),
+    ]
+    g = [(0,)]
+    workloads = {0: _AutoWorkload(d_in=128, d_out=0, compute_type="training")}
+    l_parallel = {0: (1, 4, 1)}
+    dag = _DataflowGraph(stages=[[0]])
+
+    total = bridge.simulate_iteration(g, l_parallel, workloads, assignments, dataflow_graph=dag)
+    assert total > 0.0
